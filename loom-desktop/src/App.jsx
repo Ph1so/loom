@@ -223,6 +223,7 @@ export default function Loom() {
   });
   const [showNew, setShowNew]         = useState(null);   // null | parentId string (null means root)
   const [newTitle, setNewTitle]       = useState("");
+  const [newDescription, setNewDescription] = useState("");
   const [newType, setNewType]         = useState("question");
   const [search, setSearch]           = useState("");
   const [collapsed, setCollapsed]     = useState(new Set());
@@ -334,12 +335,14 @@ export default function Loom() {
   const createThread = () => {
     if (!newTitle.trim()) return;
     const parentId = showNew === "root" ? null : showNew;
+    const description = newDescription.trim();
     const t = {
       id: Date.now().toString(), title: newTitle.trim(), type: newType,
       parentId, entries: [], createdAt: "Today", updatedAt: "Today",
+      ...(description ? { description } : {}),
     };
     setThreads(p => [...p, t]);
-    setShowNew(null); setNewTitle("");
+    setShowNew(null); setNewTitle(""); setNewDescription("");
     go(t.id);
   };
 
@@ -402,6 +405,18 @@ export default function Loom() {
     const trimmed = (title || "").trim();
     if (!trimmed) return;
     setThreads(p => p.map(t => t.id === tid ? { ...t, title: trimmed } : t));
+  };
+
+  const setThreadDescription = (tid, description) => {
+    const trimmed = (description || "").trim();
+    setThreads(p => p.map(t => {
+      if (t.id !== tid) return t;
+      if (!trimmed) {
+        const { description: _drop, ...rest } = t;
+        return rest;
+      }
+      return { ...t, description: trimmed };
+    }));
   };
 
   const deleteThread = (tid) => {
@@ -499,7 +514,7 @@ export default function Loom() {
   const filtered = threads.filter(t => t.id === "inbox" || !search || t.title.toLowerCase().includes(search.toLowerCase()));
   const rootThreads = filtered.filter(t => t.id !== "inbox" && !t.parentId);
 
-  const ops = { addEntry, updateEntry, toggleCheck, pinEntry, setDueDate, setEntryDate, deleteEntry, moveEntry, reorderEntries, renameThread, deleteThread };
+  const ops = { addEntry, updateEntry, toggleCheck, pinEntry, setDueDate, setEntryDate, deleteEntry, moveEntry, reorderEntries, renameThread, setThreadDescription, deleteThread };
   const selection = { selectedThreadIds, selectedEntryIds, toggleThreadSelection, toggleEntrySelection, clearSelection };
   const selectionCount = selectedThreadIds.size + selectedEntryIds.size;
 
@@ -545,10 +560,11 @@ export default function Loom() {
         {showNew !== null && (
           <NewModal
             title={newTitle} setTitle={setNewTitle}
+            description={newDescription} setDescription={setNewDescription}
             type={newType} setType={setNewType}
             parentId={showNew === "root" ? null : showNew}
             parentThread={showNew && showNew !== "root" ? threads.find(t => t.id === showNew) : null}
-            onCreate={createThread} onClose={() => setShowNew(null)}
+            onCreate={createThread} onClose={() => { setShowNew(null); setNewDescription(""); }}
           />
         )}
         {showSettings && (
@@ -1405,7 +1421,7 @@ function TimelineView({ threads, go }) {
 // ─────────────────────────────────────────────────────────────
 // THREAD VIEW
 // ─────────────────────────────────────────────────────────────
-function ThreadView({ thread, threads, go, setShowNew, addEntry, updateEntry, toggleCheck, pinEntry, setDueDate, setEntryDate, deleteEntry, moveEntry, reorderEntries, renameThread, deleteThread, selectedEntryIds, toggleEntrySelection, showDoneDefault = false }) {
+function ThreadView({ thread, threads, go, setShowNew, addEntry, updateEntry, toggleCheck, pinEntry, setDueDate, setEntryDate, deleteEntry, moveEntry, reorderEntries, renameThread, setThreadDescription, deleteThread, selectedEntryIds, toggleEntrySelection, showDoneDefault = false }) {
   const cfg      = TYPES[thread.type];
   const Icon     = cfg.icon;
   const isBoard  = thread.type === "board";
@@ -1420,14 +1436,24 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, updateEntry, to
   const [dropId, setDropId]             = useState(null);
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft]     = useState(thread.title);
+  const [editingDesc, setEditingDesc]   = useState(false);
+  const [descDraft, setDescDraft]       = useState(thread.description || "");
 
   useEffect(() => { setTitleDraft(thread.title); setEditingTitle(false); }, [thread.id, thread.title]);
+  useEffect(() => { setDescDraft(thread.description || ""); setEditingDesc(false); }, [thread.id, thread.description]);
 
   const commitTitle = () => {
     const next = titleDraft.trim();
     if (next && next !== thread.title) renameThread(thread.id, next);
     else setTitleDraft(thread.title);
     setEditingTitle(false);
+  };
+
+  const commitDescription = () => {
+    const next = descDraft.trim();
+    const prev = (thread.description || "").trim();
+    if (next !== prev) setThreadDescription(thread.id, next);
+    setEditingDesc(false);
   };
 
   const handleDeleteThread = () => {
@@ -1577,6 +1603,48 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, updateEntry, to
                 </div>
               )}
             </div>
+            {!isInbox && (editingDesc ? (
+              <textarea
+                autoFocus
+                value={descDraft}
+                onChange={e => setDescDraft(e.target.value)}
+                onBlur={commitDescription}
+                onKeyDown={e => {
+                  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); commitDescription(); }
+                  if (e.key === "Escape") { setDescDraft(thread.description || ""); setEditingDesc(false); }
+                }}
+                placeholder="Describe what this thread is for..."
+                rows={3}
+                style={{
+                  display: "block", width: "100%", marginTop: 12,
+                  background: C.surf, border: `1px solid ${C.goldBorder}`, borderRadius: 8,
+                  color: C.text2, fontSize: 13, padding: "10px 12px",
+                  fontFamily: "'DM Sans', sans-serif", fontStyle: "italic",
+                  resize: "none", lineHeight: 1.55, fontWeight: 300,
+                }}
+              />
+            ) : thread.description ? (
+              <div
+                onClick={() => setEditingDesc(true)}
+                title="Click to edit description"
+                style={{
+                  marginTop: 12, fontSize: 13.5, color: C.text2, lineHeight: 1.55,
+                  fontStyle: "italic", fontWeight: 300, cursor: "text",
+                  whiteSpace: "pre-wrap",
+                }}
+              >{thread.description}</div>
+            ) : (
+              <button
+                onClick={() => setEditingDesc(true)}
+                className="ghost"
+                style={{
+                  marginTop: 10, background: "transparent", border: "none",
+                  cursor: "pointer", color: C.text3, fontSize: 12,
+                  padding: "2px 0", fontFamily: "'DM Sans', sans-serif",
+                  fontStyle: "italic", textAlign: "left",
+                }}
+              >+ Add description</button>
+            ))}
           </div>
         </div>
       </div>
@@ -1944,7 +2012,7 @@ function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, setDueDat
 // ─────────────────────────────────────────────────────────────
 // NEW THREAD MODAL
 // ─────────────────────────────────────────────────────────────
-function NewModal({ title, setTitle, type, setType, parentId, parentThread, onCreate, onClose }) {
+function NewModal({ title, setTitle, description, setDescription, type, setType, parentId, parentThread, onCreate, onClose }) {
   const ref = useRef(null);
   useEffect(() => { ref.current?.focus(); }, []);
   const parentCfg = parentThread ? TYPES[parentThread.type] : null;
@@ -1965,7 +2033,11 @@ function NewModal({ title, setTitle, type, setType, parentId, parentThread, onCr
         )}
         <input ref={ref} value={title} onChange={e => setTitle(e.target.value)} onKeyDown={e => e.key === "Enter" && onCreate()}
           placeholder="Give this thread a title..."
-          style={{ width: "100%", background: C.surf2, border: `1px solid ${C.border}`, borderRadius: 10, color: C.text, fontSize: 14.5, padding: "13px 16px", marginBottom: 24, fontWeight: 300 }} />
+          style={{ width: "100%", background: C.surf2, border: `1px solid ${C.border}`, borderRadius: 10, color: C.text, fontSize: 14.5, padding: "13px 16px", marginBottom: 12, fontWeight: 300 }} />
+        <textarea value={description} onChange={e => setDescription(e.target.value)}
+          onKeyDown={e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); onCreate(); } }}
+          placeholder="Describe what this thread is for (optional)..." rows={3}
+          style={{ width: "100%", background: C.surf2, border: `1px solid ${C.border}`, borderRadius: 10, color: C.text, fontSize: 13, padding: "11px 16px", marginBottom: 24, fontWeight: 300, fontStyle: "italic", resize: "none", lineHeight: 1.55, fontFamily: "'DM Sans', sans-serif" }} />
         <div style={{ fontSize: 10.5, color: C.text3, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 14, fontWeight: 500 }}>Thread Type</div>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 9, marginBottom: 30 }}>
           {Object.entries(TYPES).map(([key, cfg]) => {

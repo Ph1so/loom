@@ -109,6 +109,14 @@ function renderThread(thread, filtered, depth, lines) {
   lines.push(`${hashes} ${threadEmoji(thread)} ${titlePrefix}${thread.title}  ${badge}`);
   lines.push("");
 
+  const description = typeof thread.description === "string" ? thread.description.trim() : "";
+  if (description) {
+    for (const ln of description.split(/\r?\n/)) {
+      lines.push(`> ${ln}`);
+    }
+    lines.push("");
+  }
+
   const entries = Array.isArray(thread.entries) ? thread.entries : [];
   if (entries.length === 0) {
     lines.push("_(empty)_");
@@ -158,6 +166,8 @@ function preamble(dateStr, stats) {
     "- ✒️ **Capture** — quick notes and loose thoughts",
     "",
     "Threads can have **sub-threads**, rendered nested below their parent.",
+    "If a thread has a description, it appears as a blockquote (`>`) directly",
+    "under the thread heading — that's the thread's intent in my own words.",
     "Within a thread, entries appear in the order I curated them. An indented",
     "entry starting with `↳` is a *reply* to the entry above. On boards,",
     "`[ ]` is pending and `[x]` is done. `📌` marks a pinned/priority entry.",

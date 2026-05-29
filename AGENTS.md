@@ -91,6 +91,7 @@ type ThreadType = "question" | "progress" | "board" | "capture";
 interface Thread {
   id: string;              // timestamp-based, except the literal "inbox"
   title: string;
+  description?: string;    // user-written blurb about the thread's intent
   type: ThreadType;
   parentId: string | null; // null = root-level
   entries: Entry[];        // order in the array IS the sort order
