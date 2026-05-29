@@ -6,6 +6,7 @@ import {
   AlertCircle, BookOpen, FolderOpen, Folder, Trash2, Settings, Sun, Moon,
   Calendar
 } from "lucide-react";
+import { buildExportMarkdown } from "./export.js";
 
 const G = `
   @import url('https://fonts.googleapis.com/css2?family=Cormorant:ital,wght@0,300;0,400;0,500;1,300;1,400&family=DM+Sans:wght@300;400;500&display=swap');
@@ -67,6 +68,11 @@ const G = `
   .theme-light .sub-card:hover  { background: #F3ECDB !important; border-color: rgba(0,0,0,0.11) !important; }
   .theme-light .crumb:hover     { color: #2A2520 !important; }
   .theme-light .collapse-btn:hover { background: rgba(0,0,0,0.06) !important; }
+
+  /* ── Compact density (sidebar only) ───────────────────────── */
+  .density-compact .s-item        { padding-top: 5px !important; padding-bottom: 5px !important; }
+  .density-compact .sb-title-row  { font-size: 12px !important; }
+  .density-compact .sb-meta-row   { display: none !important; }
 `;
 
 const PALETTES = {
@@ -188,9 +194,33 @@ function displayEntryDate(entry) {
 // ─────────────────────────────────────────────────────────────
 // ROOT
 // ─────────────────────────────────────────────────────────────
+const DEFAULT_PREFS = {
+  density: "comfortable",      // "comfortable" | "compact"
+  startupView: "home",         // "home" | "timeline" | "inbox" | "last"
+  showDoneByDefault: false,    // initial value of ThreadView's showDone
+};
+
+function loadInitialPrefs() {
+  try {
+    const raw = localStorage.getItem("loom-prefs");
+    if (!raw) return DEFAULT_PREFS;
+    const parsed = JSON.parse(raw);
+    return { ...DEFAULT_PREFS, ...parsed };
+  } catch {
+    return DEFAULT_PREFS;
+  }
+}
+
 export default function Loom() {
   const [threads, setThreads]         = useState(SEED);
-  const [view, setView]               = useState("home");
+  const [prefs, setPrefs]             = useState(loadInitialPrefs);
+  const [view, setView]               = useState(() => {
+    if (prefs.startupView === "last") {
+      try { return localStorage.getItem("loom-last-view") || "home"; }
+      catch { return "home"; }
+    }
+    return prefs.startupView || "home";
+  });
   const [showNew, setShowNew]         = useState(null);   // null | parentId string (null means root)
   const [newTitle, setNewTitle]       = useState("");
   const [newType, setNewType]         = useState("question");
@@ -211,6 +241,14 @@ export default function Loom() {
   useEffect(() => {
     try { localStorage.setItem("loom-theme", theme); } catch {}
   }, [theme]);
+
+  useEffect(() => {
+    try { localStorage.setItem("loom-prefs", JSON.stringify(prefs)); } catch {}
+  }, [prefs]);
+
+  useEffect(() => {
+    try { localStorage.setItem("loom-last-view", view); } catch {}
+  }, [view]);
   // ── Data persistence via Electron IPC ──────────────────────
   const [dataLoaded, setDataLoaded] = useState(false);
 
@@ -223,6 +261,9 @@ export default function Loom() {
         if (data?.theme === "dark" || data?.theme === "light") {
           setTheme(data.theme);
         }
+        if (data?.prefs && typeof data.prefs === "object") {
+          setPrefs(p => ({ ...p, ...data.prefs }));
+        }
         setDataLoaded(true);
       }).catch(() => setDataLoaded(true));
     } else {
@@ -232,9 +273,9 @@ export default function Loom() {
 
   useEffect(() => {
     if (dataLoaded && window.loomAPI) {
-      window.loomAPI.saveData({ threads, theme });
+      window.loomAPI.saveData({ threads, theme, prefs });
     }
-  }, [threads, theme, dataLoaded]);
+  }, [threads, theme, prefs, dataLoaded]);
   // target shape: { id: string, position: "before"|"after"|"inside"|"root" }
 
   const current     = threads.find(t => t.id === view);
@@ -424,15 +465,36 @@ export default function Loom() {
 
   useEffect(() => {
     const onKey = (e) => {
-      if (e.key !== "Escape") return;
-      if (selectedThreadIds.size === 0 && selectedEntryIds.size === 0) return;
       const tag = (e.target?.tagName || "").toLowerCase();
-      if (tag === "input" || tag === "textarea" || e.target?.isContentEditable) return;
-      clearSelection();
+      const inField = tag === "input" || tag === "textarea" || e.target?.isContentEditable;
+
+      if (e.key === "Escape") {
+        if (selectedThreadIds.size === 0 && selectedEntryIds.size === 0) return;
+        if (inField) return;
+        clearSelection();
+        return;
+      }
+
+      if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+        if (inField || e.metaKey || e.ctrlKey || e.altKey) return;
+        if (view === "home" || view === "timeline") return;
+        const t = threads.find(th => th.id === view);
+        if (!t) return;
+        const hasKids = getChildren(threads, view).length > 0;
+        if (!hasKids) return;
+        const isOpen = !collapsed.has(view);
+        if (e.key === "ArrowRight" && !isOpen) {
+          e.preventDefault();
+          toggleCollapse(view);
+        } else if (e.key === "ArrowLeft" && isOpen) {
+          e.preventDefault();
+          toggleCollapse(view);
+        }
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selectedThreadIds, selectedEntryIds]);
+  }, [selectedThreadIds, selectedEntryIds, view, threads, collapsed]);
 
   const filtered = threads.filter(t => t.id === "inbox" || !search || t.title.toLowerCase().includes(search.toLowerCase()));
   const rootThreads = filtered.filter(t => t.id !== "inbox" && !t.parentId);
@@ -444,7 +506,7 @@ export default function Loom() {
   return (
     <>
       <style dangerouslySetInnerHTML={{ __html: G }} />
-      <div className={`theme-${theme}`} style={{ display: "flex", height: "100vh", background: C.bg, fontFamily: "'DM Sans', sans-serif", color: C.text, overflow: "hidden" }}>
+      <div className={`theme-${theme} density-${prefs.density}`} style={{ display: "flex", height: "100vh", background: C.bg, fontFamily: "'DM Sans', sans-serif", color: C.text, overflow: "hidden" }}>
         <Sidebar
           threads={threads} filtered={filtered} rootThreads={rootThreads}
           view={view} go={go} search={search} setSearch={setSearch}
@@ -466,6 +528,7 @@ export default function Loom() {
             <ThreadView
               key={current.id} thread={current} threads={threads} go={go}
               setShowNew={setShowNew}
+              showDoneDefault={prefs.showDoneByDefault}
               {...ops}
               {...selection}
             />
@@ -492,6 +555,9 @@ export default function Loom() {
           <SettingsModal
             theme={theme}
             setTheme={setTheme}
+            prefs={prefs}
+            setPrefs={setPrefs}
+            threads={threads}
             onClose={() => setShowSettings(false)}
           />
         )}
@@ -553,17 +619,318 @@ function SelectionBar({ threadCount, entryCount, onDelete, onClear }) {
 // ─────────────────────────────────────────────────────────────
 // SETTINGS MODAL
 // ─────────────────────────────────────────────────────────────
-function SettingsModal({ theme, setTheme, onClose }) {
+function SettingsSection({ label, children }) {
+  return (
+    <div style={{ marginBottom: 20 }}>
+      <div style={{ marginBottom: 10, fontSize: 10.5, color: C.text3, letterSpacing: "0.10em", textTransform: "uppercase", fontWeight: 500 }}>
+        {label}
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>{children}</div>
+    </div>
+  );
+}
+
+function SettingsRow({ label, hint, children }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16, padding: "10px 12px", background: "transparent", border: `1px solid ${C.border}`, borderRadius: 9 }}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0, flex: 1 }}>
+        <span style={{ fontSize: 12.5, color: C.text, fontWeight: 500 }}>{label}</span>
+        {hint && <span style={{ fontSize: 11, color: C.text3, lineHeight: 1.4 }}>{hint}</span>}
+      </div>
+      <div style={{ flexShrink: 0 }}>{children}</div>
+    </div>
+  );
+}
+
+function SegSelect({ value, onChange, options }) {
+  return (
+    <div style={{ display: "inline-flex", background: "rgba(0,0,0,0.18)", border: `1px solid ${C.border}`, borderRadius: 8, padding: 2 }}>
+      {options.map(opt => {
+        const active = value === opt.value;
+        return (
+          <button
+            key={opt.value}
+            onClick={() => onChange(opt.value)}
+            style={{
+              padding: "5px 10px",
+              fontSize: 11.5, fontWeight: 500,
+              background: active ? C.goldDim : "transparent",
+              color: active ? C.gold : C.text2,
+              border: active ? `1px solid ${C.goldBorder}` : "1px solid transparent",
+              borderRadius: 6, cursor: "pointer",
+            }}
+          >
+            {opt.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function ToggleSwitch({ checked, onChange }) {
+  return (
+    <button
+      onClick={() => onChange(!checked)}
+      role="switch"
+      aria-checked={checked}
+      style={{
+        width: 36, height: 20, borderRadius: 999,
+        background: checked ? C.gold : "rgba(255,255,255,0.10)",
+        border: `1px solid ${checked ? C.goldBorder : C.border}`,
+        position: "relative", cursor: "pointer", padding: 0,
+        transition: "background 0.16s, border-color 0.16s",
+      }}
+    >
+      <span style={{
+        position: "absolute", top: 1, left: checked ? 17 : 1,
+        width: 16, height: 16, borderRadius: "50%",
+        background: checked ? "#1A1610" : C.text,
+        transition: "left 0.16s",
+      }} />
+    </button>
+  );
+}
+
+function ActionButton({ onClick, children }) {
+  return (
+    <button
+      onClick={onClick}
+      className="ghost"
+      style={{
+        padding: "6px 12px", fontSize: 12, fontWeight: 500,
+        background: "transparent", color: C.text,
+        border: `1px solid ${C.border}`, borderRadius: 7,
+        cursor: "pointer",
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+// Recursively collect a thread and all its descendants, in any order.
+function collectSubtreeIds(threads, rootId) {
+  const out = new Set([rootId]);
+  const walk = (pid) => {
+    for (const t of threads) {
+      if (t.parentId === pid) {
+        out.add(t.id);
+        walk(t.id);
+      }
+    }
+  };
+  walk(rootId);
+  return out;
+}
+
+function ExportPickerNode({ thread, threads, depth, selectedIds, onToggle }) {
+  const cfg = TYPES[thread.type] || TYPES.capture;
+  const Icon = cfg.icon;
+  const children = getChildren(threads, thread.id);
+  const isChecked = selectedIds.has(thread.id);
+  const meta = thread.type === "board"
+    ? `${thread.entries.filter(e => e.checked).length}/${thread.entries.length}`
+    : `${thread.entries.length}`;
+
+  return (
+    <>
+      <label
+        className="ghost"
+        style={{
+          display: "flex", alignItems: "center", gap: 9,
+          padding: "7px 10px", marginLeft: depth * 16,
+          cursor: "pointer", borderRadius: 7,
+          opacity: isChecked ? 1 : 0.65,
+        }}
+      >
+        <input
+          type="checkbox"
+          checked={isChecked}
+          onChange={e => onToggle(thread.id, e.target.checked)}
+          style={{ width: 14, height: 14, accentColor: C.gold, cursor: "pointer", flexShrink: 0, margin: 0 }}
+        />
+        <Icon size={11} color={isChecked ? cfg.color : C.text3} style={{ flexShrink: 0 }} />
+        <span style={{ fontSize: 12.5, color: isChecked ? C.text : C.text2, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {thread.title}
+        </span>
+        <span style={{ fontSize: 10.5, color: C.text3, flexShrink: 0 }}>{meta}</span>
+      </label>
+      {children.map(child => (
+        <ExportPickerNode
+          key={child.id} thread={child} threads={threads} depth={depth + 1}
+          selectedIds={selectedIds} onToggle={onToggle}
+        />
+      ))}
+    </>
+  );
+}
+
+function ExportPickerModal({ threads, onClose }) {
+  const [selectedIds, setSelectedIds] = useState(() => new Set(threads.map(t => t.id)));
+  const [msg, setMsg] = useState(null);
+
   useEffect(() => {
-    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); onClose(); } };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  const themeOptions = [
-    { id: "dark",  label: "Dark",  desc: "Warm dark cream — the default", icon: Moon },
-    { id: "light", label: "Light", desc: "Warm cream paper",              icon: Sun  },
-  ];
+  const flash = (text, error = false) => {
+    setMsg({ text, error });
+    setTimeout(() => setMsg(null), 2200);
+  };
+
+  // Toggling a thread cascades to all its descendants. We don't auto-uncheck
+  // ancestors when a child is unticked — users may want most of a subtree.
+  const onToggle = (id, checked) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      const subtree = collectSubtreeIds(threads, id);
+      for (const tid of subtree) {
+        if (checked) next.add(tid); else next.delete(tid);
+      }
+      return next;
+    });
+  };
+
+  const selectAll = () => setSelectedIds(new Set(threads.map(t => t.id)));
+  const deselectAll = () => setSelectedIds(new Set());
+
+  const handleCopy = async () => {
+    try {
+      const md = buildExportMarkdown(threads, { selectedIds });
+      await navigator.clipboard.writeText(md);
+      flash("Copied");
+    } catch (e) {
+      console.error("Copy failed:", e);
+      flash("Copy failed", true);
+    }
+  };
+
+  const handleSave = async () => {
+    if (!window.loomAPI?.exportMarkdown) return;
+    const md = buildExportMarkdown(threads, { selectedIds });
+    const res = await window.loomAPI.exportMarkdown(md);
+    if (res?.ok) flash("Saved");
+    else if (res?.canceled) setMsg(null);
+    else flash("Save failed", true);
+  };
+
+  const inbox = threads.find(t => t.id === "inbox");
+  const roots = threads.filter(t => t.parentId == null && t.id !== "inbox");
+  const ordered = inbox ? [inbox, ...roots] : roots;
+  const selectedCount = selectedIds.size;
+  const total = threads.length;
+  const nothingSelected = selectedCount === 0;
+
+  return (
+    <div
+      onClick={e => { e.stopPropagation(); onClose(); }}
+      style={{ position: "fixed", inset: 0, background: "rgba(6,5,4,0.55)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 260, animation: "fadeIn 0.18s ease both", backdropFilter: "blur(6px)" }}
+    >
+      <div
+        onClick={e => e.stopPropagation()}
+        style={{ width: 540, maxWidth: "92vw", maxHeight: "86vh", display: "flex", flexDirection: "column", background: C.surf, border: `1px solid ${C.border}`, borderRadius: 14, animation: "slideIn 0.22s ease both", boxShadow: "0 24px 60px rgba(0,0,0,0.5)" }}
+      >
+        <div style={{ padding: "22px 24px 14px", borderBottom: `1px solid ${C.border}`, flexShrink: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+            <div style={{ fontFamily: "'Cormorant', serif", fontSize: 22, fontWeight: 400, letterSpacing: "-0.01em" }}>Export for LLM</div>
+            <button onClick={onClose} className="ghost" style={{ background: "transparent", border: "none", cursor: "pointer", color: C.text3, padding: 6, borderRadius: 6, display: "flex" }}>
+              <X size={15} />
+            </button>
+          </div>
+          <div style={{ fontSize: 12, color: C.text3, lineHeight: 1.5 }}>
+            Pick which threads to include. Selecting a thread also picks its sub-threads.
+          </div>
+          <div style={{ marginTop: 14, display: "flex", alignItems: "center", gap: 8 }}>
+            <ActionButton onClick={selectAll}>Select all</ActionButton>
+            <ActionButton onClick={deselectAll}>Deselect all</ActionButton>
+            <span style={{ marginLeft: "auto", fontSize: 11, color: C.text3 }}>
+              {selectedCount} of {total} selected
+            </span>
+          </div>
+        </div>
+
+        <div style={{ flex: 1, overflowY: "auto", padding: "10px 14px 14px", minHeight: 120 }}>
+          {ordered.length === 0
+            ? <div style={{ padding: 24, textAlign: "center", color: C.text3, fontSize: 12 }}>No threads yet.</div>
+            : ordered.map(t => (
+                <ExportPickerNode
+                  key={t.id} thread={t} threads={threads} depth={0}
+                  selectedIds={selectedIds} onToggle={onToggle}
+                />
+              ))
+          }
+        </div>
+
+        <div style={{ padding: "12px 24px 16px", borderTop: `1px solid ${C.border}`, display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
+          {msg && <span style={{ fontSize: 11, color: msg.error ? "#E08A8A" : C.gold }}>{msg.text}</span>}
+          <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+            <button
+              onClick={handleCopy}
+              disabled={nothingSelected}
+              className="ghost"
+              style={{
+                padding: "6px 12px", fontSize: 12, fontWeight: 500,
+                background: "transparent", color: nothingSelected ? C.text3 : C.text,
+                border: `1px solid ${C.border}`, borderRadius: 7,
+                cursor: nothingSelected ? "not-allowed" : "pointer",
+                opacity: nothingSelected ? 0.5 : 1,
+              }}
+            >
+              Copy
+            </button>
+            <button
+              onClick={handleSave}
+              disabled={nothingSelected}
+              className="gold-btn"
+              style={{
+                padding: "6px 14px", fontSize: 12, fontWeight: 500,
+                background: nothingSelected ? "transparent" : C.goldDim,
+                color: nothingSelected ? C.text3 : C.gold,
+                border: `1px solid ${nothingSelected ? C.border : C.goldBorder}`,
+                borderRadius: 7,
+                cursor: nothingSelected ? "not-allowed" : "pointer",
+                opacity: nothingSelected ? 0.5 : 1,
+              }}
+            >
+              Save .md…
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SettingsModal({ theme, setTheme, prefs, setPrefs, threads, onClose }) {
+  const [exportMsg, setExportMsg] = useState(null);
+  const [showLlmPicker, setShowLlmPicker] = useState(false);
+
+  useEffect(() => {
+    const onKey = (e) => {
+      // Let the picker swallow Escape when it's open
+      if (e.key === "Escape" && !showLlmPicker) onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose, showLlmPicker]);
+
+  const setPref = (key, value) => setPrefs(p => ({ ...p, [key]: value }));
+
+  const handleExport = async () => {
+    if (!window.loomAPI?.exportData) return;
+    const res = await window.loomAPI.exportData();
+    if (res?.ok) setExportMsg("Saved");
+    else if (res?.canceled) setExportMsg(null);
+    else setExportMsg("Export failed");
+    if (res?.ok) setTimeout(() => setExportMsg(null), 2200);
+  };
+
+  const handleReveal = () => {
+    if (window.loomAPI?.revealDataFile) window.loomAPI.revealDataFile();
+  };
 
   return (
     <div
@@ -572,50 +939,85 @@ function SettingsModal({ theme, setTheme, onClose }) {
     >
       <div
         onClick={e => e.stopPropagation()}
-        style={{ width: 460, maxWidth: "92vw", background: C.surf, border: `1px solid ${C.border}`, borderRadius: 14, padding: "22px 24px", animation: "slideIn 0.22s ease both", boxShadow: "0 24px 60px rgba(0,0,0,0.5)" }}
+        style={{ width: 500, maxWidth: "92vw", maxHeight: "86vh", overflowY: "auto", background: C.surf, border: `1px solid ${C.border}`, borderRadius: 14, padding: "22px 24px 18px", animation: "slideIn 0.22s ease both", boxShadow: "0 24px 60px rgba(0,0,0,0.5)" }}
       >
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 18 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 22 }}>
           <div style={{ fontFamily: "'Cormorant', serif", fontSize: 24, fontWeight: 400, letterSpacing: "-0.01em" }}>Settings</div>
           <button onClick={onClose} className="ghost" style={{ background: "transparent", border: "none", cursor: "pointer", color: C.text3, padding: 6, borderRadius: 6, display: "flex" }}>
             <X size={15} />
           </button>
         </div>
 
-        <div style={{ marginBottom: 8, fontSize: 11, color: C.text3, letterSpacing: "0.08em", textTransform: "uppercase", fontWeight: 500 }}>
-          Appearance
-        </div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 6 }}>
-          {themeOptions.map(opt => {
-            const Icon = opt.icon;
-            const active = theme === opt.id;
-            return (
-              <button
-                key={opt.id}
-                onClick={() => setTheme(opt.id)}
-                className="type-pick"
-                style={{
-                  textAlign: "left", cursor: "pointer",
-                  background: active ? C.goldDim : "transparent",
-                  border: `1px solid ${active ? C.goldBorder : C.border}`,
-                  borderRadius: 10, padding: "12px 14px",
-                  display: "flex", flexDirection: "column", gap: 6,
-                  color: C.text,
-                }}
-              >
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <Icon size={14} color={active ? C.gold : C.text2} />
-                  <span style={{ fontSize: 13, fontWeight: 500, color: active ? C.gold : C.text }}>{opt.label}</span>
-                </div>
-                <span style={{ fontSize: 11.5, color: C.text3, lineHeight: 1.4 }}>{opt.desc}</span>
-              </button>
-            );
-          })}
-        </div>
+        <SettingsSection label="Appearance">
+          <SettingsRow label="Theme" hint="Warm dark cream or warm light paper">
+            <SegSelect
+              value={theme}
+              onChange={setTheme}
+              options={[
+                { value: "dark",  label: "Dark"  },
+                { value: "light", label: "Light" },
+              ]}
+            />
+          </SettingsRow>
 
-        <div style={{ marginTop: 18, fontSize: 11, color: C.text3 }}>
-          More preferences coming soon.
-        </div>
+          <SettingsRow label="Sidebar density" hint="Comfortable shows entry counts; compact hides them">
+            <SegSelect
+              value={prefs.density}
+              onChange={(v) => setPref("density", v)}
+              options={[
+                { value: "comfortable", label: "Comfortable" },
+                { value: "compact",     label: "Compact"     },
+              ]}
+            />
+          </SettingsRow>
+        </SettingsSection>
+
+        <SettingsSection label="Behavior">
+          <SettingsRow label="Startup view" hint="What Loom opens to when you launch it">
+            <SegSelect
+              value={prefs.startupView}
+              onChange={(v) => setPref("startupView", v)}
+              options={[
+                { value: "home",     label: "Home"     },
+                { value: "timeline", label: "Timeline" },
+                { value: "inbox",    label: "Inbox"    },
+                { value: "last",     label: "Last"     },
+              ]}
+            />
+          </SettingsRow>
+
+          <SettingsRow label="Show completed entries by default" hint="When opening a board, expand the completed section automatically">
+            <ToggleSwitch
+              checked={prefs.showDoneByDefault}
+              onChange={(v) => setPref("showDoneByDefault", v)}
+            />
+          </SettingsRow>
+        </SettingsSection>
+
+        <SettingsSection label="Data">
+          <SettingsRow label="Export for LLM" hint="Pick threads and copy or save a markdown digest — paste into ChatGPT/Claude to ask questions about your Loom">
+            <ActionButton onClick={() => setShowLlmPicker(true)}>Export…</ActionButton>
+          </SettingsRow>
+
+          <SettingsRow label="Export to JSON" hint="Save a backup copy of all your threads and entries">
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              {exportMsg && <span style={{ fontSize: 11, color: exportMsg === "Saved" ? C.gold : "#E08A8A" }}>{exportMsg}</span>}
+              <ActionButton onClick={handleExport}>Export…</ActionButton>
+            </div>
+          </SettingsRow>
+
+          <SettingsRow label="Data file" hint="Loom stores everything in a single local file">
+            <ActionButton onClick={handleReveal}>Reveal in Finder</ActionButton>
+          </SettingsRow>
+        </SettingsSection>
       </div>
+
+      {showLlmPicker && (
+        <ExportPickerModal
+          threads={threads}
+          onClose={() => setShowLlmPicker(false)}
+        />
+      )}
     </div>
   );
 }
@@ -727,11 +1129,6 @@ function SbThreadTree({ thread, allThreads, view, go, depth, collapsed, toggleCo
     go(thread.id);
   };
 
-  const handleRowDoubleClick = (e) => {
-    e.stopPropagation();
-    if (hasKids) toggleCollapse(thread.id);
-  };
-
   const handleDragOver = (e) => {
     e.preventDefault();
     e.stopPropagation();
@@ -767,18 +1164,28 @@ function SbThreadTree({ thread, allThreads, view, go, depth, collapsed, toggleCo
         )}
 
         {hasKids ? (
-          <button className="collapse-btn" onClick={e => { e.stopPropagation(); toggleCollapse(thread.id); }} style={{ background: "transparent", border: "none", cursor: "pointer", padding: "2px 2px 0 0", display: "flex", borderRadius: 4, flexShrink: 0 }}>
-            {isOpen ? <ChevronDown size={10} color={C.text3} /> : <ChevronRight size={10} color={C.text3} />}
+          <button
+            className="collapse-btn"
+            onClick={e => { e.stopPropagation(); toggleCollapse(thread.id); }}
+            aria-label={isOpen ? "Collapse" : "Expand"}
+            style={{
+              background: "transparent", border: "none", cursor: "pointer",
+              width: 22, height: 22, marginLeft: -4, marginRight: 2,
+              display: "flex", alignItems: "center", justifyContent: "center",
+              borderRadius: 5, flexShrink: 0,
+            }}
+          >
+            {isOpen ? <ChevronDown size={11} color={C.text3} /> : <ChevronRight size={11} color={C.text3} />}
           </button>
         ) : (
-          <div style={{ width: 14, flexShrink: 0 }} />
+          <div style={{ width: 20, flexShrink: 0 }} />
         )}
 
-        <div onClick={handleRowClick} onDoubleClick={handleRowDoubleClick} style={{ display: "flex", alignItems: "flex-start", gap: 8, flex: 1, minWidth: 0 }}>
+        <div onClick={handleRowClick} style={{ display: "flex", alignItems: "flex-start", gap: 8, flex: 1, minWidth: 0 }}>
           <Icon size={11} color={on ? cfg.color : (isDropInside ? C.gold : C.text3)} style={{ marginTop: 3, flexShrink: 0 }} />
           <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={{ fontSize: 12.5, color: on ? C.text : (isDropInside ? C.gold : C.text2), fontWeight: on ? 500 : 400, lineHeight: 1.35, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{thread.title}</div>
-            <div style={{ fontSize: 10, color: isDropInside ? "rgba(200,165,100,0.6)" : C.text3, marginTop: 1 }}>
+            <div className="sb-title-row" style={{ fontSize: 12.5, color: on ? C.text : (isDropInside ? C.gold : C.text2), fontWeight: on ? 500 : 400, lineHeight: 1.35, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{thread.title}</div>
+            <div className="sb-meta-row" style={{ fontSize: 10, color: isDropInside ? "rgba(200,165,100,0.6)" : C.text3, marginTop: 1 }}>
               {isDropInside
                 ? "Move inside this thread"
                 : done !== null
@@ -998,7 +1405,7 @@ function TimelineView({ threads, go }) {
 // ─────────────────────────────────────────────────────────────
 // THREAD VIEW
 // ─────────────────────────────────────────────────────────────
-function ThreadView({ thread, threads, go, setShowNew, addEntry, updateEntry, toggleCheck, pinEntry, setDueDate, setEntryDate, deleteEntry, moveEntry, reorderEntries, renameThread, deleteThread, selectedEntryIds, toggleEntrySelection }) {
+function ThreadView({ thread, threads, go, setShowNew, addEntry, updateEntry, toggleCheck, pinEntry, setDueDate, setEntryDate, deleteEntry, moveEntry, reorderEntries, renameThread, deleteThread, selectedEntryIds, toggleEntrySelection, showDoneDefault = false }) {
   const cfg      = TYPES[thread.type];
   const Icon     = cfg.icon;
   const isBoard  = thread.type === "board";
@@ -1008,7 +1415,7 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, updateEntry, to
   const [editingId, setEditingId]       = useState(null);
   const [replyingTo, setReplyingTo]     = useState(null);
   const [entrySubtype, setEntrySubtype] = useState("entry");
-  const [showDone, setShowDone]         = useState(false);
+  const [showDone, setShowDone]         = useState(showDoneDefault);
   const [dragId, setDragId]             = useState(null);
   const [dropId, setDropId]             = useState(null);
   const [editingTitle, setEditingTitle] = useState(false);

@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, shell, Menu } = require("electron");
+const { app, BrowserWindow, ipcMain, shell, Menu, dialog } = require("electron");
 const path = require("path");
 const fs = require("fs");
 
@@ -39,6 +39,57 @@ ipcMain.handle("save-data", (event, data) => {
     return false;
   }
 });
+
+ipcMain.handle("export-data", async (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const stamp = new Date().toISOString().slice(0, 10);
+  const { canceled, filePath } = await dialog.showSaveDialog(win, {
+    title: "Export Loom data",
+    defaultPath: `loom-backup-${stamp}.json`,
+    filters: [{ name: "JSON", extensions: ["json"] }],
+  });
+  if (canceled || !filePath) return { ok: false, canceled: true };
+  try {
+    fs.copyFileSync(dataPath, filePath);
+    return { ok: true, path: filePath };
+  } catch (e) {
+    console.error("Failed to export data:", e);
+    return { ok: false, error: String(e?.message || e) };
+  }
+});
+
+ipcMain.handle("export-markdown", async (event, markdown) => {
+  if (typeof markdown !== "string" || markdown.length === 0) {
+    return { ok: false, error: "Empty export" };
+  }
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const stamp = new Date().toISOString().slice(0, 10);
+  const { canceled, filePath } = await dialog.showSaveDialog(win, {
+    title: "Export Loom for LLM",
+    defaultPath: `loom-context-${stamp}.md`,
+    filters: [{ name: "Markdown", extensions: ["md"] }],
+  });
+  if (canceled || !filePath) return { ok: false, canceled: true };
+  try {
+    fs.writeFileSync(filePath, markdown, "utf8");
+    return { ok: true, path: filePath };
+  } catch (e) {
+    console.error("Failed to write markdown export:", e);
+    return { ok: false, error: String(e?.message || e) };
+  }
+});
+
+ipcMain.handle("reveal-data-file", () => {
+  try {
+    shell.showItemInFolder(dataPath);
+    return true;
+  } catch (e) {
+    console.error("Failed to reveal data file:", e);
+    return false;
+  }
+});
+
+ipcMain.handle("get-data-path", () => dataPath);
 
 // ── Window ───────────────────────────────────────────────────
 function createWindow() {
