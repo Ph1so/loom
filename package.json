@@ -1,0 +1,44 @@
+{
+  "name": "loom",
+  "version": "1.0.0",
+  "description": "Your personal thread-based journal",
+  "main": "electron/main.js",
+  "scripts": {
+    "dev": "concurrently -k -n VITE,ELECTRON -c cyan,yellow \"vite\" \"wait-on tcp:5173 && electron .\"",
+    "build": "vite build && electron-builder --mac --dir",
+    "build:dmg": "vite build && electron-builder --mac dmg"
+  },
+  "build": {
+    "appId": "com.loom.app",
+    "productName": "Loom",
+    "copyright": "Personal use",
+    "mac": {
+      "category": "public.app-category.productivity",
+      "icon": "assets/icon.icns",
+      "target": [{ "target": "dir" }],
+      "darkModeSupport": true
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "output": "release"
+    }
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.2.1",
+    "concurrently": "^8.2.2",
+    "electron": "^29.1.0",
+    "electron-builder": "^24.13.3",
+    "vite": "^5.2.0",
+    "wait-on": "^7.2.0"
+  },
+  "dependencies": {
+    "lucide-react": "^0.383.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  }
+}
