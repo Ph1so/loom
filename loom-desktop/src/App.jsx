@@ -7,6 +7,7 @@ import {
   Calendar
 } from "lucide-react";
 import { buildExportMarkdown } from "./export.js";
+import { PALETTES } from "./palette.js";
 
 const G = `
   @import url('https://fonts.googleapis.com/css2?family=Cormorant:ital,wght@0,300;0,400;0,500;1,300;1,400&family=DM+Sans:wght@300;400;500&display=swap');
@@ -75,25 +76,6 @@ const G = `
   .density-compact .sb-meta-row   { display: none !important; }
 `;
 
-const PALETTES = {
-  dark: {
-    bg: "#0B0A08", sb: "#0E0D0A", surf: "#151310", surf2: "#1C1A15",
-    border: "rgba(255,255,255,0.07)", text: "#EDE6D6",
-    text2: "#7A7264", text3: "#474038",
-    entryText: "#C8C0AE",
-    chkBorder: "rgba(255,255,255,0.18)",
-    gold: "#C8A564", goldDim: "rgba(200,165,100,0.1)", goldBorder: "rgba(200,165,100,0.22)",
-  },
-  light: {
-    bg: "#FDFAF3", sb: "#F5EFE2", surf: "#FFFFFF", surf2: "#FAF6EC",
-    border: "rgba(0,0,0,0.09)", text: "#2A2520",
-    text2: "#6B6356", text3: "#A39A87",
-    entryText: "#3A322B",
-    chkBorder: "rgba(60,46,28,0.45)",
-    gold: "#9C7E40", goldDim: "rgba(156,126,64,0.10)", goldBorder: "rgba(156,126,64,0.28)",
-  },
-};
-
 // `C` is read by every component during render. We reassign it at the top of
 // the `Loom` render based on the active theme, so subsequent child renders see
 // the right palette. Safe because React renders happen synchronously top-down.
@@ -157,6 +139,17 @@ function formatDue(iso) {
   if (diff === -1) return "Yesterday";
   const d = new Date(`${iso}T00:00:00`);
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+// Render an Electron accelerator string (e.g. "Alt+Space") with Mac glyphs.
+function formatAccelerator(accel) {
+  return accel
+    .split("+")
+    .map(part => ({
+      CmdOrCtrl: "⌘", Cmd: "⌘", Command: "⌘", Ctrl: "⌃", Control: "⌃",
+      Alt: "⌥", Option: "⌥", Shift: "⇧", Space: "Space",
+    }[part] || part))
+    .join(" ");
 }
 
 // Local YYYY-MM-DD (avoids UTC drift from toISOString)
@@ -277,6 +270,22 @@ export default function Loom() {
       window.loomAPI.saveData({ threads, theme, prefs });
     }
   }, [threads, theme, prefs, dataLoaded]);
+
+  // The widget captures into the data file directly (via the main process), then
+  // broadcasts "data-changed". Reload threads so those captures appear live.
+  useEffect(() => {
+    if (!window.loomAPI?.onDataChanged) return;
+    return window.loomAPI.onDataChanged(() => {
+      window.loomAPI.loadData().then(data => {
+        if (data && Array.isArray(data.threads)) setThreads(data.threads);
+      }).catch(() => {});
+    });
+  }, []);
+
+  // Keep the widget's theme in sync with the app so it always matches.
+  useEffect(() => {
+    window.loomAPI?.setWidgetConfig?.({ theme });
+  }, [theme]);
   // target shape: { id: string, position: "before"|"after"|"inside"|"root" }
 
   const current     = threads.find(t => t.id === view);
@@ -294,6 +303,11 @@ export default function Loom() {
   };
 
   const startThreadDrag = (id) => setDragState({ dragging: id, target: null });
+
+  // Always reset on drag end so an aborted/cancelled drag (released over empty
+  // space, outside the sidebar, or Esc) never leaves the UI stuck in "dragging"
+  // mode. onDrop only fires over a valid target, so it can't be relied on alone.
+  const endThreadDrag = () => setDragState({ dragging: null, target: null });
 
   const updateDropTarget = (e, id, position) => {
     e.preventDefault();
@@ -529,6 +543,7 @@ export default function Loom() {
           collapsed={collapsed} toggleCollapse={toggleCollapse}
           dragState={dragState}
           startThreadDrag={startThreadDrag}
+          endThreadDrag={endThreadDrag}
           updateDropTarget={updateDropTarget}
           handleThreadDrop={handleThreadDrop}
           openSettings={() => setShowSettings(true)}
@@ -692,7 +707,7 @@ function ToggleSwitch({ checked, onChange }) {
       aria-checked={checked}
       style={{
         width: 36, height: 20, borderRadius: 999,
-        background: checked ? C.gold : "rgba(255,255,255,0.10)",
+        background: checked ? C.gold : C.overlayHi,
         border: `1px solid ${checked ? C.goldBorder : C.border}`,
         position: "relative", cursor: "pointer", padding: 0,
         transition: "background 0.16s, border-color 0.16s",
@@ -701,7 +716,7 @@ function ToggleSwitch({ checked, onChange }) {
       <span style={{
         position: "absolute", top: 1, left: checked ? 17 : 1,
         width: 16, height: 16, borderRadius: "50%",
-        background: checked ? "#1A1610" : C.text,
+        background: checked ? C.onGold : C.text,
         transition: "left 0.16s",
       }} />
     </button>
@@ -843,7 +858,7 @@ function ExportPickerModal({ threads, onClose }) {
   return (
     <div
       onClick={e => { e.stopPropagation(); onClose(); }}
-      style={{ position: "fixed", inset: 0, background: "rgba(6,5,4,0.55)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 260, animation: "fadeIn 0.18s ease both", backdropFilter: "blur(6px)" }}
+      style={{ position: "fixed", inset: 0, background: C.scrim, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 260, animation: "fadeIn 0.18s ease both", backdropFilter: "blur(6px)" }}
     >
       <div
         onClick={e => e.stopPropagation()}
@@ -923,6 +938,17 @@ function ExportPickerModal({ threads, onClose }) {
 function SettingsModal({ theme, setTheme, prefs, setPrefs, threads, onClose }) {
   const [exportMsg, setExportMsg] = useState(null);
   const [showLlmPicker, setShowLlmPicker] = useState(false);
+  const [widgetCfg, setWidgetCfg] = useState(null);
+
+  useEffect(() => {
+    window.loomAPI?.getWidgetConfig?.().then(cfg => setWidgetCfg(cfg)).catch(() => {});
+  }, []);
+
+  // Optimistically update local state and push the change to the main process.
+  const setWidget = (patch) => {
+    setWidgetCfg(c => ({ ...c, ...patch }));
+    window.loomAPI?.setWidgetConfig?.(patch);
+  };
 
   useEffect(() => {
     const onKey = (e) => {
@@ -951,7 +977,7 @@ function SettingsModal({ theme, setTheme, prefs, setPrefs, threads, onClose }) {
   return (
     <div
       onClick={onClose}
-      style={{ position: "fixed", inset: 0, background: "rgba(6,5,4,0.55)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 250, animation: "fadeIn 0.18s ease both", backdropFilter: "blur(6px)" }}
+      style={{ position: "fixed", inset: 0, background: C.scrim, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 250, animation: "fadeIn 0.18s ease both", backdropFilter: "blur(6px)" }}
     >
       <div
         onClick={e => e.stopPropagation()}
@@ -1010,6 +1036,41 @@ function SettingsModal({ theme, setTheme, prefs, setPrefs, threads, onClose }) {
           </SettingsRow>
         </SettingsSection>
 
+        {widgetCfg && (
+          <SettingsSection label="Quick Capture Widget">
+            <SettingsRow label="Show widget on desktop" hint="A small always-available box for capturing thoughts straight to Inbox">
+              <ToggleSwitch
+                checked={!!widgetCfg.visible}
+                onChange={(v) => setWidget({ visible: v })}
+              />
+            </SettingsRow>
+
+            <SettingsRow label="Layering" hint="Float keeps it above other windows; Among windows lets it be covered like a desktop widget">
+              <SegSelect
+                value={widgetCfg.layering || "float"}
+                onChange={(v) => setWidget({ layering: v })}
+                options={[
+                  { value: "float",  label: "Float on top"   },
+                  { value: "recede", label: "Among windows" },
+                ]}
+              />
+            </SettingsRow>
+
+            <SettingsRow label="Launch at login" hint="Keep the widget available automatically when you log in">
+              <ToggleSwitch
+                checked={!!widgetCfg.launchAtLogin}
+                onChange={(v) => setWidget({ launchAtLogin: v })}
+              />
+            </SettingsRow>
+
+            <SettingsRow label="Global shortcut" hint="Press anywhere to summon and focus the widget">
+              <span style={{ fontSize: 12, color: C.text2, fontWeight: 500, padding: "5px 11px", background: C.overlay, border: `1px solid ${C.border}`, borderRadius: 7 }}>
+                {formatAccelerator(widgetCfg.hotkey || "Alt+Space")}
+              </span>
+            </SettingsRow>
+          </SettingsSection>
+        )}
+
         <SettingsSection label="Data">
           <SettingsRow label="Export for LLM" hint="Pick threads and copy or save a markdown digest — paste into ChatGPT/Claude to ask questions about your Loom">
             <ActionButton onClick={() => setShowLlmPicker(true)}>Export…</ActionButton>
@@ -1041,7 +1102,7 @@ function SettingsModal({ theme, setTheme, prefs, setPrefs, threads, onClose }) {
 // ─────────────────────────────────────────────────────────────
 // SIDEBAR
 // ─────────────────────────────────────────────────────────────
-function Sidebar({ threads, filtered, rootThreads, view, go, search, setSearch, setShowNew, inboxCount, collapsed, toggleCollapse, dragState, startThreadDrag, updateDropTarget, handleThreadDrop, openSettings, selectedThreadIds, toggleThreadSelection, clearSelection }) {
+function Sidebar({ threads, filtered, rootThreads, view, go, search, setSearch, setShowNew, inboxCount, collapsed, toggleCollapse, dragState, startThreadDrag, endThreadDrag, updateDropTarget, handleThreadDrop, openSettings, selectedThreadIds, toggleThreadSelection, clearSelection }) {
   const isDragging    = !!dragState.dragging;
   const isRootTarget  = dragState.target?.position === "root";
 
@@ -1053,7 +1114,7 @@ function Sidebar({ threads, filtered, rootThreads, view, go, search, setSearch, 
       </div>
 
       <div style={{ padding: "0 14px 10px", flexShrink: 0 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, background: "rgba(255,255,255,0.04)", border: `1px solid ${C.border}`, borderRadius: 9, padding: "7px 12px" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, background: C.overlay, border: `1px solid ${C.border}`, borderRadius: 9, padding: "7px 12px" }}>
           <Search size={12} color={C.text3} />
           <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Filter threads..." style={{ background: "transparent", border: "none", color: C.text, fontSize: 12.5, flex: 1 }} />
         </div>
@@ -1073,7 +1134,7 @@ function Sidebar({ threads, filtered, rootThreads, view, go, search, setSearch, 
             fontSize: 9.5, color: isDragging ? (isRootTarget ? C.gold : C.text3) : C.text3,
             letterSpacing: "0.09em", textTransform: "uppercase",
             padding: "10px 10px 6px", fontWeight: 500,
-            border: isDragging ? `1px dashed ${isRootTarget ? "rgba(200,165,100,0.4)" : "rgba(255,255,255,0.08)"}` : "1px solid transparent",
+            border: isDragging ? `1px dashed ${isRootTarget ? "rgba(200,165,100,0.4)" : C.dashed}` : "1px solid transparent",
             marginBottom: isDragging ? 6 : 0,
           }}
           onDragOver={e => { e.preventDefault(); setDragState && updateDropTarget(e, "root-zone", "root"); }}
@@ -1086,7 +1147,7 @@ function Sidebar({ threads, filtered, rootThreads, view, go, search, setSearch, 
           <SbThreadTree
             key={t.id} thread={t} allThreads={filtered} view={view} go={go} depth={0}
             collapsed={collapsed} toggleCollapse={toggleCollapse}
-            dragState={dragState} startThreadDrag={startThreadDrag}
+            dragState={dragState} startThreadDrag={startThreadDrag} endThreadDrag={endThreadDrag}
             updateDropTarget={updateDropTarget} handleThreadDrop={handleThreadDrop}
             selectedThreadIds={selectedThreadIds}
             toggleThreadSelection={toggleThreadSelection}
@@ -1119,7 +1180,7 @@ function SbItem({ icon: Icon, label, active, onClick, badge, badgeColor }) {
   );
 }
 
-function SbThreadTree({ thread, allThreads, view, go, depth, collapsed, toggleCollapse, dragState, startThreadDrag, updateDropTarget, handleThreadDrop, selectedThreadIds, toggleThreadSelection, clearSelection }) {
+function SbThreadTree({ thread, allThreads, view, go, depth, collapsed, toggleCollapse, dragState, startThreadDrag, endThreadDrag, updateDropTarget, handleThreadDrop, selectedThreadIds, toggleThreadSelection, clearSelection }) {
   const cfg      = TYPES[thread.type];
   const Icon     = cfg.icon;
   const on       = view === thread.id;
@@ -1135,6 +1196,10 @@ function SbThreadTree({ thread, allThreads, view, go, depth, collapsed, toggleCo
   const isDropInside   = target?.id === thread.id && target.position === "inside";
   const isSelected     = selectedThreadIds?.has(thread.id);
 
+  // Pointer position when the drag began, used to tell a real drag from the
+  // browser starting a phantom drag on a click that had a few px of jitter.
+  const dragOrigin = useRef(null);
+
   const handleRowClick = (e) => {
     e.stopPropagation();
     if (e.shiftKey || e.metaKey || e.ctrlKey) {
@@ -1143,6 +1208,25 @@ function SbThreadTree({ thread, allThreads, view, go, depth, collapsed, toggleCo
     }
     clearSelection?.();
     go(thread.id);
+  };
+
+  const handleDragStart = (e) => {
+    e.stopPropagation();
+    dragOrigin.current = { x: e.clientX, y: e.clientY };
+    startThreadDrag(thread.id);
+  };
+
+  const handleDragEnd = (e) => {
+    endThreadDrag?.();
+    // A draggable element makes Chromium suppress the trailing `click` whenever
+    // the pointer moved even a few px between press and release (trackpad
+    // jitter). Recover that swallowed click: if this "drag" never really moved,
+    // treat it as a click so a single press reliably opens the thread.
+    const origin = dragOrigin.current;
+    dragOrigin.current = null;
+    if (!origin) return;
+    const moved = Math.abs(e.clientX - origin.x) + Math.abs(e.clientY - origin.y);
+    if (moved < 5) handleRowClick(e);
   };
 
   const handleDragOver = (e) => {
@@ -1163,10 +1247,10 @@ function SbThreadTree({ thread, allThreads, view, go, depth, collapsed, toggleCo
 
       <div
         draggable
-        onDragStart={e => { e.stopPropagation(); startThreadDrag(thread.id); }}
+        onDragStart={handleDragStart}
         onDragOver={handleDragOver}
         onDrop={e => { e.stopPropagation(); handleThreadDrop(); }}
-        onDragEnd={() => { /* cleared by handleThreadDrop or onDrop */ }}
+        onDragEnd={handleDragEnd}
         className={`s-item ${on ? "on" : ""} ${isDropInside ? "drop-inside" : ""} ${isDraggingThis ? "thread-dragging" : ""} ${isSelected ? "selected" : ""}`}
         style={{
           padding: "8px 10px", cursor: "grab", display: "flex", alignItems: "flex-start",
@@ -1176,7 +1260,7 @@ function SbThreadTree({ thread, allThreads, view, go, depth, collapsed, toggleCo
         }}
       >
         {depth > 0 && (
-          <div style={{ position: "absolute", left: -10, top: 0, bottom: 0, width: 1, background: "rgba(255,255,255,0.06)", pointerEvents: "none" }} />
+          <div style={{ position: "absolute", left: -10, top: 0, bottom: 0, width: 1, background: C.divider, pointerEvents: "none" }} />
         )}
 
         {hasKids ? (
@@ -1186,7 +1270,7 @@ function SbThreadTree({ thread, allThreads, view, go, depth, collapsed, toggleCo
             aria-label={isOpen ? "Collapse" : "Expand"}
             style={{
               background: "transparent", border: "none", cursor: "pointer",
-              width: 22, height: 22, marginLeft: -4, marginRight: 2,
+              width: 22, height: 17, marginLeft: -4, marginRight: 2,
               display: "flex", alignItems: "center", justifyContent: "center",
               borderRadius: 5, flexShrink: 0,
             }}
@@ -1219,12 +1303,12 @@ function SbThreadTree({ thread, allThreads, view, go, depth, collapsed, toggleCo
       )}
 
       {hasKids && isOpen && (
-        <div style={{ borderLeft: `1px solid rgba(255,255,255,0.05)`, marginLeft: depth * 14 + 18 }}>
+        <div style={{ borderLeft: `1px solid ${C.divider}`, marginLeft: depth * 14 + 18 }}>
           {children.map(child => (
             <SbThreadTree
               key={child.id} thread={child} allThreads={allThreads} view={view} go={go} depth={depth + 1}
               collapsed={collapsed} toggleCollapse={toggleCollapse}
-              dragState={dragState} startThreadDrag={startThreadDrag}
+              dragState={dragState} startThreadDrag={startThreadDrag} endThreadDrag={endThreadDrag}
               updateDropTarget={updateDropTarget} handleThreadDrop={handleThreadDrop}
               selectedThreadIds={selectedThreadIds}
               toggleThreadSelection={toggleThreadSelection}
@@ -1268,9 +1352,9 @@ function HomeView({ threads, rootThreads, go, setShowNew, addEntry }) {
             onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); doCapture(); } }}
             placeholder="Capture a thought -- goes straight to Inbox for triage later..."
             rows={3} style={{ width: "100%", background: "transparent", border: "none", color: C.text, fontSize: 15, lineHeight: 1.75, resize: "none", fontWeight: 300 }} />
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 18, paddingTop: 16, borderTop: "1px solid rgba(255,255,255,0.05)" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 18, paddingTop: 16, borderTop: `1px solid ${C.divider}` }}>
             <span style={{ fontSize: 12, color: C.text3 }}>Enter to capture · Shift+Enter for new line</span>
-            <button onClick={doCapture} className="gold-btn" style={{ background: capture.trim() ? C.gold : C.goldDim, border: "none", borderRadius: 8, color: capture.trim() ? "#0B0A08" : C.text3, fontSize: 12.5, padding: "8px 18px", cursor: capture.trim() ? "pointer" : "default", fontWeight: 500 }}>Capture</button>
+            <button onClick={doCapture} className="gold-btn" style={{ background: capture.trim() ? C.gold : C.goldDim, border: "none", borderRadius: 8, color: capture.trim() ? C.onGold : C.text3, fontSize: 12.5, padding: "8px 18px", cursor: capture.trim() ? "pointer" : "default", fontWeight: 500 }}>Capture</button>
           </div>
         </div>
       </div>
@@ -1279,7 +1363,7 @@ function HomeView({ threads, rootThreads, go, setShowNew, addEntry }) {
         <div style={{ fontSize: 11, color: C.text3, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 20, fontWeight: 500 }}>All Threads</div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(272px, 1fr))", gap: 14 }}>
           {rootThreads.map((t, i) => <ThreadCard key={t.id} thread={t} threads={threads} go={go} i={i} />)}
-          <div className="add-new t-card" onClick={() => setShowNew("root")} style={{ border: "1.5px dashed rgba(255,255,255,0.09)", borderRadius: 16, padding: "26px 24px", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10, minHeight: 130, color: C.text3, transition: "all 0.2s" }}>
+          <div className="add-new t-card" onClick={() => setShowNew("root")} style={{ border: `1.5px dashed ${C.dashed}`, borderRadius: 16, padding: "26px 24px", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10, minHeight: 130, color: C.text3, transition: "all 0.2s" }}>
             <Plus size={18} strokeWidth={1.5} />
             <span style={{ fontSize: 12.5 }}>New Thread</span>
           </div>
@@ -1359,7 +1443,7 @@ function ThreadCard({ thread, threads, go, i }) {
       {last && <div style={{ fontSize: 12, color: C.text3, lineHeight: 1.6, overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>{last.text}</div>}
       <div style={{ marginTop: 16, display: "flex", alignItems: "center", gap: 8 }}>
         {done !== null && total > 0 && (
-          <div style={{ flex: 1, height: 2, background: "rgba(255,255,255,0.06)", borderRadius: 2, overflow: "hidden" }}>
+          <div style={{ flex: 1, height: 2, background: C.track, borderRadius: 2, overflow: "hidden" }}>
             <div style={{ height: "100%", width: `${(done / total) * 100}%`, background: cfg.color, opacity: 0.7 }} />
           </div>
         )}
@@ -1596,7 +1680,7 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, updateEntry, to
               {children.length > 0 && <span style={{ fontSize: 11.5, color: C.text3 }}>{children.length} sub-thread{children.length > 1 ? "s" : ""}</span>}
               {done !== null && total > 0 && (
                 <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
-                  <div style={{ width: 60, height: 2, background: "rgba(255,255,255,0.07)", borderRadius: 2 }}>
+                  <div style={{ width: 60, height: 2, background: C.track, borderRadius: 2 }}>
                     <div style={{ height: "100%", width: `${(done / total) * 100}%`, background: cfg.color, opacity: 0.75 }} />
                   </div>
                   <span style={{ fontSize: 10.5, color: C.text3 }}>{Math.round((done / total) * 100)}%</span>
@@ -1706,7 +1790,7 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, updateEntry, to
           <button className="subtype-toggle" onClick={() => setEntrySubtype("entry")} style={{ display: "flex", alignItems: "center", gap: 5, padding: "4px 10px", borderRadius: 6, border: `1px solid ${entrySubtype === "entry" ? cfg.color + "50" : C.border}`, background: entrySubtype === "entry" ? cfg.bg : "transparent", cursor: "pointer", color: entrySubtype === "entry" ? cfg.color : C.text3, fontSize: 11, fontWeight: 500 }}>
             <List size={10} /> Entry
           </button>
-          <button className="subtype-toggle" onClick={() => setEntrySubtype("note")} style={{ display: "flex", alignItems: "center", gap: 5, padding: "4px 10px", borderRadius: 6, border: `1px solid ${entrySubtype === "note" ? "rgba(255,255,255,0.2)" : C.border}`, background: entrySubtype === "note" ? "rgba(255,255,255,0.05)" : "transparent", cursor: "pointer", color: entrySubtype === "note" ? C.text2 : C.text3, fontSize: 11, fontWeight: 500 }}>
+          <button className="subtype-toggle" onClick={() => setEntrySubtype("note")} style={{ display: "flex", alignItems: "center", gap: 5, padding: "4px 10px", borderRadius: 6, border: `1px solid ${entrySubtype === "note" ? C.text3 : C.border}`, background: entrySubtype === "note" ? C.overlay : "transparent", cursor: "pointer", color: entrySubtype === "note" ? C.text2 : C.text3, fontSize: 11, fontWeight: 500 }}>
             <AlignLeft size={10} /> Note
           </button>
         </div>
@@ -1716,7 +1800,7 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, updateEntry, to
             placeholder={placeholder} rows={2}
             style={{ flex: 1, background: C.surf, border: `1px solid ${replyingTo ? cfg.color + "30" : C.border}`, borderRadius: 12, color: C.text, fontSize: 14, padding: "14px 18px", resize: "none", lineHeight: 1.65, fontWeight: 300, fontStyle: entrySubtype === "note" ? "italic" : "normal", transition: "border-color 0.2s" }}
           />
-          <button onClick={handleAdd} className="gold-btn" style={{ background: entryText.trim() ? C.gold : C.goldDim, border: "none", borderRadius: 12, color: entryText.trim() ? "#0B0A08" : C.text3, padding: "0 26px", cursor: entryText.trim() ? "pointer" : "default", fontWeight: 500, fontSize: 13.5, flexShrink: 0 }}>
+          <button onClick={handleAdd} className="gold-btn" style={{ background: entryText.trim() ? C.gold : C.goldDim, border: "none", borderRadius: 12, color: entryText.trim() ? C.onGold : C.text3, padding: "0 26px", cursor: entryText.trim() ? "pointer" : "default", fontWeight: 500, fontSize: 13.5, flexShrink: 0 }}>
             {replyingTo ? "Reply" : "Add"}
           </button>
         </div>
@@ -1732,7 +1816,7 @@ function SubThreadSection({ children, parentThread, go, setShowNew }) {
     return (
       <div style={{ marginBottom: 32 }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 0 }}>
-          <button onClick={() => setShowNew(parentThread.id)} style={{ display: "flex", alignItems: "center", gap: 6, background: "transparent", border: `1px dashed rgba(255,255,255,0.1)`, borderRadius: 8, color: C.text3, fontSize: 12, padding: "7px 14px", cursor: "pointer", fontFamily: "'DM Sans', sans-serif", transition: "all 0.15s" }}>
+          <button onClick={() => setShowNew(parentThread.id)} style={{ display: "flex", alignItems: "center", gap: 6, background: "transparent", border: `1px dashed ${C.dashed}`, borderRadius: 8, color: C.text3, fontSize: 12, padding: "7px 14px", cursor: "pointer", fontFamily: "'DM Sans', sans-serif", transition: "all 0.15s" }}>
             <Plus size={11} /> Add sub-thread
           </button>
         </div>
@@ -1767,7 +1851,7 @@ function SubThreadSection({ children, parentThread, go, setShowNew }) {
                 {done !== null ? `${done}/${child.entries.length} done` : `${child.entries.length} entries`}
               </div>
               {done !== null && child.entries.length > 0 && (
-                <div style={{ marginTop: 8, height: 2, background: "rgba(255,255,255,0.06)", borderRadius: 2, overflow: "hidden" }}>
+                <div style={{ marginTop: 8, height: 2, background: C.track, borderRadius: 2, overflow: "hidden" }}>
                   <div style={{ height: "100%", width: `${(done / child.entries.length) * 100}%`, background: cfg.color, opacity: 0.7 }} />
                 </div>
               )}
@@ -1885,7 +1969,7 @@ function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, setDueDat
       onClick={handleRowClick}
       style={{
         display: "flex", gap: 12, padding: "14px 8px",
-        borderBottom: "1px solid rgba(255,255,255,0.04)",
+        borderBottom: `1px solid ${C.divider}`,
         alignItems: "flex-start", position: "relative",
         animation: `fadeUp 0.18s ${Math.min(i, 6) * 0.012}s ease both`,
         ...(isSelected ? { background: "rgba(200,165,100,0.10)", outline: `1px solid ${C.goldBorder}`, borderRadius: 8 } : null),
@@ -1936,7 +2020,7 @@ function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, setDueDat
                   aria-hidden="true"
                 />
               </span>
-              {isNote && <span style={{ fontSize: 10, color: C.text3, background: "rgba(255,255,255,0.04)", padding: "1px 7px", borderRadius: 4 }}>note</span>}
+              {isNote && <span style={{ fontSize: 10, color: C.text3, background: C.overlay, padding: "1px 7px", borderRadius: 4 }}>note</span>}
               {entry.pinned && <span style={{ fontSize: 10, color: C.gold, display: "flex", alignItems: "center", gap: 3 }}><Pin size={9} /> pinned</span>}
               {entry.dueDate && (
                 <span
@@ -2017,8 +2101,8 @@ function NewModal({ title, setTitle, description, setDescription, type, setType,
   useEffect(() => { ref.current?.focus(); }, []);
   const parentCfg = parentThread ? TYPES[parentThread.type] : null;
   return (
-    <div style={{ position: "fixed", inset: 0, background: "rgba(6,5,4,0.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 200, animation: "fadeIn 0.18s ease both", backdropFilter: "blur(6px)" }}>
-      <div style={{ background: "#161410", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 18, padding: "36px", width: 440, animation: "slideIn 0.22s ease both", boxShadow: "0 32px 80px rgba(0,0,0,0.5)" }}>
+    <div style={{ position: "fixed", inset: 0, background: C.scrim, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 200, animation: "fadeIn 0.18s ease both", backdropFilter: "blur(6px)" }}>
+      <div style={{ background: C.modalSurf, border: `1px solid ${C.border}`, borderRadius: 18, padding: "36px", width: 440, animation: "slideIn 0.22s ease both", boxShadow: "0 32px 80px rgba(0,0,0,0.5)" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: parentThread ? 16 : 30 }}>
           <div style={{ fontFamily: "'Cormorant', serif", fontSize: 24, fontWeight: 400 }}>{parentThread ? "New Sub-thread" : "New Thread"}</div>
           <button className="ghost" onClick={onClose} style={{ background: "transparent", border: "none", cursor: "pointer", padding: 6, borderRadius: 7, display: "flex" }}>
@@ -2054,7 +2138,7 @@ function NewModal({ title, setTitle, description, setDescription, type, setType,
             );
           })}
         </div>
-        <button onClick={onCreate} className="gold-btn" style={{ width: "100%", background: C.gold, border: "none", borderRadius: 11, color: "#0B0A08", fontSize: 14, padding: "14px", fontWeight: 600, cursor: "pointer" }}>
+        <button onClick={onCreate} className="gold-btn" style={{ width: "100%", background: C.gold, border: "none", borderRadius: 11, color: C.onGold, fontSize: 14, padding: "14px", fontWeight: 600, cursor: "pointer" }}>
           {parentThread ? "Create Sub-thread" : "Create Thread"}
         </button>
       </div>

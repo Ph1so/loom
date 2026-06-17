@@ -7,4 +7,18 @@ contextBridge.exposeInMainWorld("loomAPI", {
   exportMarkdown: (markdown) => ipcRenderer.invoke("export-markdown", markdown),
   revealDataFile: () => ipcRenderer.invoke("reveal-data-file"),
   getDataPath: () => ipcRenderer.invoke("get-data-path"),
+
+  // Quick Capture widget
+  quickCapture: (text) => ipcRenderer.invoke("quick-capture", text),
+  getWidgetConfig: () => ipcRenderer.invoke("get-widget-config"),
+  setWidgetConfig: (patch) => ipcRenderer.invoke("set-widget-config", patch),
+  hideWidget: () => ipcRenderer.invoke("hide-widget"),
+
+  // Notifies the renderer when the data file changed underneath it (e.g. a
+  // widget capture). Returns an unsubscribe function.
+  onDataChanged: (cb) => {
+    const handler = () => cb();
+    ipcRenderer.on("data-changed", handler);
+    return () => ipcRenderer.removeListener("data-changed", handler);
+  },
 });
