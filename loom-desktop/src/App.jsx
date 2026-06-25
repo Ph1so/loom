@@ -4,7 +4,7 @@ import {
   LayoutGrid, Feather, Zap, Clock, Pin, CornerDownRight, ChevronDown,
   ChevronRight, Inbox, GripVertical, AlignLeft, List,
   AlertCircle, BookOpen, FolderOpen, Folder, Trash2, Settings, Sun, Moon,
-  Calendar
+  Calendar, FolderInput, ExternalLink, ArrowUp, ArrowDown
 } from "lucide-react";
 import { buildExportMarkdown } from "./export.js";
 import { PALETTES } from "./palette.js";
@@ -93,7 +93,7 @@ const TYPES = {
 const SEED = [
   {
     id: "inbox", type: "capture", title: "Inbox", special: "inbox", parentId: null,
-    createdAt: "Today", updatedAt: "Today",
+    createdAt: nowISO(), updatedAt: nowISO(),
     entries: [],
   },
 ];
@@ -160,6 +160,43 @@ function localISO(d) {
   return `${y}-${m}-${day}`;
 }
 
+// ISO date of the Sunday that starts the week containing `d` (local).
+// Used as the key for the weekly form reminder: the reminder is "active"
+// for a given week until the user marks that week's Sunday done.
+function weekStartSunday(d = new Date()) {
+  const x = new Date(d);
+  x.setHours(0, 0, 0, 0);
+  x.setDate(x.getDate() - x.getDay()); // getDay() === 0 on Sunday
+  return localISO(x);
+}
+
+// The hardcoded weekly check-in reminder. Surfaces on Home every week
+// (starting Sunday) and only disappears once marked done for that week.
+const FORM_REMINDER = {
+  url: "https://forms.gle/whrFx6J4wjgf3RaMA",
+  title: "Weekly check-in",
+  blurb: "Fill out this week's form",
+};
+
+// Parse pasted multi-line text into entries, one per non-empty line.
+// Understands markdown bullets/numbers and `- [x]` / `- [ ]` checkboxes.
+function parseBulkEntries(raw) {
+  return (raw || "").split(/\r?\n/).map(line => {
+    let text = line.trim();
+    if (!text) return null;
+    let checked = false;
+    const cb = text.match(/^(?:[-*•+]\s*)?\[([ xX])\]\s*(.*)$/);
+    if (cb) {
+      checked = cb[1].toLowerCase() === "x";
+      text = cb[2].trim();
+    } else {
+      text = text.replace(/^([-*•+]|\d+[.)])\s+/, "").trim();
+    }
+    if (!text) return null;
+    return { text, checked };
+  }).filter(Boolean);
+}
+
 function isoFromTs(ts) {
   if (typeof ts !== "number") return null;
   const d = new Date();
@@ -184,6 +221,33 @@ function displayEntryDate(entry) {
   return entry?.date || "";
 }
 
+// Real wall-clock timestamp stored on threads (createdAt/updatedAt) and entries
+// (createdAt). Replaces the old "Today" sentinel so temporal reasoning — in the
+// app and in the LLM export — works against actual dates.
+function nowISO() {
+  return new Date().toISOString();
+}
+
+// Stamp a thread as just-modified. Used by every mutation so `updatedAt` is
+// trustworthy (previously only a couple of paths set it).
+function touchThread(t) {
+  return { ...t, updatedAt: nowISO() };
+}
+
+// Compact, human display for a stored timestamp. Tolerates the legacy "Today"
+// sentinel and any non-ISO leftovers so old data files keep rendering.
+function formatTimestamp(value) {
+  if (!value || typeof value !== "string") return "";
+  if (value === "Today") return "Today";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return value;
+  const diff = dueDayDiff(localISO(d));
+  if (diff === 0) return "Today";
+  if (diff === -1) return "Yesterday";
+  if (diff !== null && diff < 0 && diff > -7) return `${-diff}d ago`;
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
 // ─────────────────────────────────────────────────────────────
 // ROOT
 // ─────────────────────────────────────────────────────────────
@@ -191,6 +255,7 @@ const DEFAULT_PREFS = {
   density: "comfortable",      // "comfortable" | "compact"
   startupView: "home",         // "home" | "timeline" | "inbox" | "last"
   showDoneByDefault: false,    // initial value of ThreadView's showDone
+  formReminderDoneWeek: null,  // ISO Sunday of the last week the form reminder was cleared
 };
 
 function loadInitialPrefs() {
@@ -352,7 +417,7 @@ export default function Loom() {
     const description = newDescription.trim();
     const t = {
       id: Date.now().toString(), title: newTitle.trim(), type: newType,
-      parentId, entries: [], createdAt: "Today", updatedAt: "Today",
+      parentId, entries: [], createdAt: nowISO(), updatedAt: nowISO(),
       ...(description ? { description } : {}),
     };
     setThreads(p => [...p, t]);
@@ -362,63 +427,105 @@ export default function Loom() {
 
   const addEntry = (tid, text, subtype, parentEntryId) => {
     if (!text.trim()) return;
-    const e = { id: Date.now().toString(), text: text.trim(), dateISO: localISO(new Date()), date: "Today", ts: 0, checked: false, pinned: false, subtype: subtype || "entry", parentEntryId: parentEntryId || null };
-    setThreads(p => p.map(t => t.id === tid ? { ...t, entries: [...t.entries, e], updatedAt: "Today" } : t));
+    const e = { id: Date.now().toString(), text: text.trim(), dateISO: localISO(new Date()), date: "Today", ts: 0, createdAt: nowISO(), checked: false, pinned: false, subtype: subtype || "entry", parentEntryId: parentEntryId || null };
+    setThreads(p => p.map(t => t.id === tid ? touchThread({ ...t, entries: [...t.entries, e] }) : t));
+  };
+
+  // Bulk add: items = [{ text, checked }], one entry per item, single state write.
+  const addEntries = (tid, items, subtype) => {
+    const clean = (items || []).filter(it => it && it.text && it.text.trim());
+    if (!clean.length) return;
+    const base = Date.now();
+    const dateISO = localISO(new Date());
+    const created = nowISO();
+    const newEntries = clean.map((it, i) => ({
+      id: (base + i).toString(), text: it.text.trim(), dateISO, date: "Today", ts: 0,
+      createdAt: created, checked: !!it.checked, pinned: false, subtype: subtype || "entry", parentEntryId: null,
+    }));
+    setThreads(p => p.map(t => t.id === tid ? touchThread({ ...t, entries: [...t.entries, ...newEntries] }) : t));
   };
 
   const updateEntry = (tid, eid, text) => {
     if (!text.trim()) return;
     setThreads(p => p.map(t => t.id === tid
-      ? { ...t, entries: t.entries.map(e => e.id === eid ? { ...e, text: text.trim() } : e) } : t));
+      ? touchThread({ ...t, entries: t.entries.map(e => e.id === eid ? { ...e, text: text.trim() } : e) }) : t));
   };
 
   const toggleCheck = (tid, eid) => {
     setThreads(p => p.map(t => t.id === tid
-      ? { ...t, entries: t.entries.map(e => e.id === eid ? { ...e, checked: !e.checked } : e) } : t));
+      ? touchThread({ ...t, entries: t.entries.map(e => e.id === eid ? { ...e, checked: !e.checked } : e) }) : t));
   };
 
   const pinEntry = (tid, eid) => {
     setThreads(p => p.map(t => t.id === tid
-      ? { ...t, entries: t.entries.map(e => e.id === eid ? { ...e, pinned: !e.pinned } : e) } : t));
+      ? touchThread({ ...t, entries: t.entries.map(e => e.id === eid ? { ...e, pinned: !e.pinned } : e) }) : t));
   };
 
   const setDueDate = (tid, eid, dueDate) => {
     setThreads(p => p.map(t => t.id === tid
-      ? { ...t, entries: t.entries.map(e => e.id === eid ? { ...e, dueDate: dueDate || null } : e) } : t));
+      ? touchThread({ ...t, entries: t.entries.map(e => e.id === eid ? { ...e, dueDate: dueDate || null } : e) }) : t));
   };
 
   const setEntryDate = (tid, eid, iso) => {
     if (!iso) return;
     setThreads(p => p.map(t => t.id === tid
-      ? { ...t, entries: t.entries.map(e => e.id === eid ? { ...e, dateISO: iso } : e) } : t));
+      ? touchThread({ ...t, entries: t.entries.map(e => e.id === eid ? { ...e, dateISO: iso } : e) }) : t));
   };
 
   const deleteEntry = (tid, eid) => {
-    setThreads(p => p.map(t => t.id === tid ? { ...t, entries: t.entries.filter(e => e.id !== eid) } : t));
+    setThreads(p => p.map(t => t.id === tid ? touchThread({ ...t, entries: t.entries.filter(e => e.id !== eid) }) : t));
   };
 
-  const moveEntry = (fromTid, eid, toTid) => {
-    let moved = null;
-    setThreads(p => {
-      const from = p.find(t => t.id === fromTid);
-      moved = from?.entries.find(e => e.id === eid);
-      if (!moved) return p;
-      return p.map(t => {
-        if (t.id === fromTid) return { ...t, entries: t.entries.filter(e => e.id !== eid) };
-        if (t.id === toTid)   return { ...t, entries: [...t.entries, { ...moved, pinned: false }], updatedAt: "Today" };
-        return t;
+  // Move a set of entries (plus their reply descendants) to another thread.
+  // Replies whose parent isn't also moving become top-level entries in the destination.
+  const moveEntriesTo = (eids, toTid) => {
+    const ids = eids instanceof Set ? eids : new Set(eids);
+    if (ids.size === 0 || !toTid) return;
+    setThreads(prev => {
+      if (!prev.some(t => t.id === toTid)) return prev;
+      const collected = [];
+      const stripped = prev.map(t => {
+        if (t.id === toTid) return t; // destination handled after; moving within a thread is a no-op
+        const childrenOf = {};
+        t.entries.forEach(e => {
+          if (e.parentEntryId) (childrenOf[e.parentEntryId] ||= []).push(e.id);
+        });
+        const toMove = new Set();
+        const visit = (id) => {
+          if (toMove.has(id)) return;
+          toMove.add(id);
+          (childrenOf[id] || []).forEach(visit);
+        };
+        t.entries.forEach(e => { if (ids.has(e.id)) visit(e.id); });
+        if (toMove.size === 0) return t;
+        t.entries.forEach(e => {
+          if (!toMove.has(e.id)) return;
+          const keepParent = e.parentEntryId && toMove.has(e.parentEntryId);
+          collected.push({ ...e, pinned: false, parentEntryId: keepParent ? e.parentEntryId : null });
+        });
+        return touchThread({ ...t, entries: t.entries.filter(e => !toMove.has(e.id)) });
       });
+      if (collected.length === 0) return prev;
+      return stripped.map(t => t.id === toTid ? touchThread({ ...t, entries: [...t.entries, ...collected] }) : t);
     });
   };
 
+  const moveEntry = (fromTid, eid, toTid) => moveEntriesTo(new Set([eid]), toTid);
+
+  const moveSelectedEntries = (toTid) => {
+    if (!toTid || selectedEntryIds.size === 0) return;
+    moveEntriesTo(selectedEntryIds, toTid);
+    setSelectedEntryIds(new Set());
+  };
+
   const reorderEntries = (tid, newEntries) => {
-    setThreads(p => p.map(t => t.id === tid ? { ...t, entries: newEntries } : t));
+    setThreads(p => p.map(t => t.id === tid ? touchThread({ ...t, entries: newEntries }) : t));
   };
 
   const renameThread = (tid, title) => {
     const trimmed = (title || "").trim();
     if (!trimmed) return;
-    setThreads(p => p.map(t => t.id === tid ? { ...t, title: trimmed } : t));
+    setThreads(p => p.map(t => t.id === tid ? touchThread({ ...t, title: trimmed }) : t));
   };
 
   const setThreadDescription = (tid, description) => {
@@ -427,9 +534,32 @@ export default function Loom() {
       if (t.id !== tid) return t;
       if (!trimmed) {
         const { description: _drop, ...rest } = t;
-        return rest;
+        return touchThread(rest);
       }
-      return { ...t, description: trimmed };
+      return touchThread({ ...t, description: trimmed });
+    }));
+  };
+
+  const setThreadDisplayMode = (tid, mode) => {
+    setThreads(p => p.map(t => {
+      if (t.id !== tid) return t;
+      if (!mode || mode === "list") {
+        const { displayMode: _drop, ...rest } = t;
+        return touchThread(rest);
+      }
+      return touchThread({ ...t, displayMode: mode });
+    }));
+  };
+
+  // Per-thread entry sort: "manual" (array order, drag-reorderable) | "asc" | "desc" by date.
+  const setThreadSortOrder = (tid, order) => {
+    setThreads(p => p.map(t => {
+      if (t.id !== tid) return t;
+      if (order !== "asc" && order !== "desc") {
+        const { sortOrder: _drop, ...rest } = t;
+        return touchThread(rest);
+      }
+      return touchThread({ ...t, sortOrder: order });
     }));
   };
 
@@ -528,7 +658,7 @@ export default function Loom() {
   const filtered = threads.filter(t => t.id === "inbox" || !search || t.title.toLowerCase().includes(search.toLowerCase()));
   const rootThreads = filtered.filter(t => t.id !== "inbox" && !t.parentId);
 
-  const ops = { addEntry, updateEntry, toggleCheck, pinEntry, setDueDate, setEntryDate, deleteEntry, moveEntry, reorderEntries, renameThread, setThreadDescription, deleteThread };
+  const ops = { addEntry, addEntries, updateEntry, toggleCheck, pinEntry, setDueDate, setEntryDate, deleteEntry, moveEntry, reorderEntries, renameThread, setThreadDescription, setThreadDisplayMode, setThreadSortOrder, deleteThread };
   const selection = { selectedThreadIds, selectedEntryIds, toggleThreadSelection, toggleEntrySelection, clearSelection };
   const selectionCount = selectedThreadIds.size + selectedEntryIds.size;
 
@@ -552,7 +682,7 @@ export default function Loom() {
           clearSelection={clearSelection}
         />
         <main style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
-          {view === "home"     && <HomeView     threads={threads} rootThreads={rootThreads} go={go} setShowNew={setShowNew} addEntry={addEntry} />}
+          {view === "home"     && <HomeView     threads={threads} rootThreads={rootThreads} go={go} setShowNew={setShowNew} addEntry={addEntry} prefs={prefs} setPrefs={setPrefs} />}
           {view === "timeline" && <TimelineView threads={threads} go={go} />}
           {current && view !== "home" && view !== "timeline" && (
             <ThreadView
@@ -568,6 +698,8 @@ export default function Loom() {
           <SelectionBar
             threadCount={selectedThreadIds.size}
             entryCount={selectedEntryIds.size}
+            threads={threads}
+            onMoveEntries={moveSelectedEntries}
             onDelete={deleteSelected}
             onClear={clearSelection}
           />
@@ -600,7 +732,7 @@ export default function Loom() {
 // ─────────────────────────────────────────────────────────────
 // SELECTION BAR (floating, appears when items are multi-selected)
 // ─────────────────────────────────────────────────────────────
-function SelectionBar({ threadCount, entryCount, onDelete, onClear }) {
+function SelectionBar({ threadCount, entryCount, threads = [], onMoveEntries, onDelete, onClear }) {
   const parts = [];
   if (threadCount) parts.push(`${threadCount} thread${threadCount > 1 ? "s" : ""}`);
   if (entryCount)  parts.push(`${entryCount} entr${entryCount > 1 ? "ies" : "y"}`);
@@ -620,6 +752,22 @@ function SelectionBar({ threadCount, entryCount, onDelete, onClear }) {
       }}
     >
       <span style={{ fontSize: 12.5, color: C.text2 }}>{label}</span>
+      {entryCount > 0 && (
+        <select
+          className="move-select"
+          value=""
+          onChange={e => { if (e.target.value) { onMoveEntries?.(e.target.value); e.target.value = ""; } }}
+          title="Move selected entries to another thread"
+          style={{ background: C.surf, border: `1px solid ${C.border}`, borderRadius: 8, color: C.text2, fontSize: 12, padding: "6px 10px", cursor: "pointer" }}
+        >
+          <option value="">Move to thread...</option>
+          {threads.map(t => (
+            <option key={t.id} value={t.id}>
+              {t.id === "inbox" ? "Inbox" : (t.title.length > 40 ? t.title.slice(0, 40) + "..." : t.title)}
+            </option>
+          ))}
+        </select>
+      )}
       <button
         onClick={confirm}
         className="gold-btn"
@@ -760,8 +908,9 @@ function ExportPickerNode({ thread, threads, depth, selectedIds, onToggle }) {
   const Icon = cfg.icon;
   const children = getChildren(threads, thread.id);
   const isChecked = selectedIds.has(thread.id);
+  const boardTasks = thread.entries.filter(e => e.subtype !== "note");
   const meta = thread.type === "board"
-    ? `${thread.entries.filter(e => e.checked).length}/${thread.entries.length}`
+    ? `${boardTasks.filter(e => e.checked).length}/${boardTasks.length}`
     : `${thread.entries.length}`;
 
   return (
@@ -1188,6 +1337,7 @@ function SbThreadTree({ thread, allThreads, view, go, depth, collapsed, toggleCo
   const hasKids  = children.length > 0;
   const isOpen   = !collapsed.has(thread.id);
   const done     = thread.type === "board" ? thread.entries.filter(e => e.checked).length : null;
+  const taskTotal = thread.type === "board" ? thread.entries.filter(e => e.subtype !== "note").length : thread.entries.length;
 
   const isDraggingThis = dragState.dragging === thread.id;
   const target         = dragState.target;
@@ -1289,7 +1439,7 @@ function SbThreadTree({ thread, allThreads, view, go, depth, collapsed, toggleCo
               {isDropInside
                 ? "Move inside this thread"
                 : done !== null
-                  ? `${done}/${thread.entries.length} done`
+                  ? `${done}/${taskTotal} done`
                   : `${thread.entries.length} entries`}
               {!isDropInside && hasKids && ` · ${children.length} sub`}
             </div>
@@ -1324,8 +1474,11 @@ function SbThreadTree({ thread, allThreads, view, go, depth, collapsed, toggleCo
 // ─────────────────────────────────────────────────────────────
 // HOME VIEW
 // ─────────────────────────────────────────────────────────────
-function HomeView({ threads, rootThreads, go, setShowNew, addEntry }) {
+function HomeView({ threads, rootThreads, go, setShowNew, addEntry, prefs, setPrefs }) {
   const [capture, setCapture] = useState("");
+  const thisWeek      = weekStartSunday();
+  const showReminder  = prefs.formReminderDoneWeek !== thisWeek;
+  const clearReminder = () => setPrefs(p => ({ ...p, formReminderDoneWeek: thisWeek }));
   const hrs     = new Date().getHours();
   const greet   = hrs < 12 ? "Good morning" : hrs < 17 ? "Good afternoon" : "Good evening";
   const dateStr = new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" });
@@ -1343,7 +1496,9 @@ function HomeView({ threads, rootThreads, go, setShowNew, addEntry }) {
         <div style={{ fontSize: 12.5, color: C.text3, marginTop: 8 }}>{dateStr}</div>
       </div>
 
-      <SmartSurface threads={rootThreads} go={go} />
+      {showReminder && <FormReminderCard onDone={clearReminder} />}
+
+      <SmartSurface threads={rootThreads} allThreads={threads} go={go} />
 
       <div style={{ animation: "fadeUp 0.45s 0.08s ease both", marginBottom: 56 }}>
         <div style={{ background: C.surf, border: `1px solid ${C.border}`, borderRadius: 16, padding: "22px 26px" }}>
@@ -1373,10 +1528,47 @@ function HomeView({ threads, rootThreads, go, setShowNew, addEntry }) {
   );
 }
 
-function SmartSurface({ threads, go }) {
+// Passive weekly nudge on Home. Opens the form externally (routed through
+// shell.openExternal by the main process) and only clears for the week once
+// the user marks it done; it reappears at the next week's Sunday.
+function FormReminderCard({ onDone }) {
+  return (
+    <div style={{ animation: "fadeUp 0.45s 0.02s ease both", marginBottom: 28 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 14, background: C.surf, border: `1px solid ${C.gold}`, borderRadius: 12, padding: "16px 18px" }}>
+        <div style={{ width: 34, height: 34, borderRadius: 8, background: C.goldDim, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+          <Calendar size={15} color={C.gold} />
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 11, color: C.gold, fontWeight: 500, marginBottom: 3 }}>{FORM_REMINDER.title}</div>
+          <div style={{ fontSize: 12.5, color: C.text2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{FORM_REMINDER.blurb}</div>
+        </div>
+        <button onClick={() => window.open(FORM_REMINDER.url, "_blank")} className="gold-btn"
+          style={{ display: "flex", alignItems: "center", gap: 6, background: C.gold, border: "none", borderRadius: 8, color: C.onGold, fontSize: 12, padding: "8px 14px", cursor: "pointer", fontWeight: 500, flexShrink: 0 }}>
+          <ExternalLink size={12} /> Open form
+        </button>
+        <button onClick={onDone}
+          style={{ background: "transparent", border: `1px solid ${C.border}`, borderRadius: 8, color: C.text3, fontSize: 12, padding: "8px 14px", cursor: "pointer", fontWeight: 500, flexShrink: 0 }}>
+          Done this week
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function SmartSurface({ threads, allThreads, go }) {
   const items = [];
+  // Overdue / due-soon board entries across ALL threads (time-sensitive → first).
+  (allThreads || threads).filter(t => t.type === "board" && t.id !== "inbox").forEach(t => {
+    t.entries.forEach(e => {
+      if (e.checked || e.subtype === "note" || !e.dueDate) return;
+      const diff = dueDayDiff(e.dueDate);
+      if (diff === null || diff > 7) return; // only overdue or within a week
+      items.push({ kind: "due", thread: t, entry: e, diff });
+    });
+  });
+  items.sort((a, b) => a.diff - b.diff); // most overdue first (only due items present here)
   threads.filter(t => t.type === "board").forEach(t => {
-    const pending = t.entries.filter(e => !e.checked);
+    const pending = t.entries.filter(e => !e.checked && e.subtype !== "note");
     if (pending.length > 0) {
       const pinned = pending.filter(e => e.pinned);
       items.push({ kind: "action", thread: t, pending: pending.length, topTask: (pinned[0] || pending[0]).text });
@@ -1390,7 +1582,26 @@ function SmartSurface({ threads, go }) {
     <div style={{ animation: "fadeUp 0.45s 0.04s ease both", marginBottom: 48 }}>
       <div style={{ fontSize: 11, color: C.text3, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 14, fontWeight: 500 }}>Needs Attention</div>
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        {items.map((item, i) => (
+        {items.map((item, i) => {
+          if (item.kind === "due") {
+            const overdue = item.diff < 0;
+            const accent  = overdue ? "#D67878" : C.gold;
+            return (
+              <div key={i} className="attn-card" onClick={() => go(item.thread.id)} style={{ display: "flex", alignItems: "center", gap: 14, background: C.surf, border: `1px solid ${C.border}`, borderRadius: 12, padding: "14px 18px" }}>
+                <div style={{ width: 34, height: 34, borderRadius: 8, background: TYPES.board.bg, border: `1px solid ${TYPES.board.border}`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                  <Calendar size={15} color={accent} />
+                </div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 11, color: accent, fontWeight: 500, marginBottom: 3 }}>
+                    {overdue ? "Overdue" : item.diff === 0 ? "Due today" : formatDue(item.entry.dueDate)} · {item.thread.title}
+                  </div>
+                  <div style={{ fontSize: 12.5, color: C.text2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{item.entry.text}</div>
+                </div>
+                <ChevronRight size={14} color={C.text3} />
+              </div>
+            );
+          }
+          return (
           <div key={i} className="attn-card" onClick={() => go(item.thread.id)} style={{ display: "flex", alignItems: "center", gap: 14, background: C.surf, border: `1px solid ${C.border}`, borderRadius: 12, padding: "14px 18px" }}>
             <div style={{ width: 34, height: 34, borderRadius: 8, background: TYPES[item.kind === "action" ? "board" : "question"].bg, border: `1px solid ${TYPES[item.kind === "action" ? "board" : "question"].border}`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
               {item.kind === "action" ? <AlertCircle size={15} color={TYPES.board.color} /> : <BookOpen size={15} color={TYPES.question.color} />}
@@ -1403,7 +1614,8 @@ function SmartSurface({ threads, go }) {
             </div>
             <ChevronRight size={14} color={C.text3} />
           </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );
@@ -1413,8 +1625,9 @@ function ThreadCard({ thread, threads, go, i }) {
   const cfg      = TYPES[thread.type];
   const Icon     = cfg.icon;
   const last     = thread.entries[thread.entries.length - 1];
-  const done     = thread.type === "board" ? thread.entries.filter(e => e.checked).length : null;
-  const total    = thread.entries.length;
+  const isBoardT = thread.type === "board";
+  const done     = isBoardT ? thread.entries.filter(e => e.checked).length : null;
+  const total    = isBoardT ? thread.entries.filter(e => e.subtype !== "note").length : thread.entries.length;
   const children = getChildren(threads, thread.id);
   return (
     <div className="t-card" onClick={() => go(thread.id)} style={{ background: C.surf, border: `1px solid ${C.border}`, borderRadius: 16, padding: "22px 24px", cursor: "pointer", animation: `fadeUp 0.24s ${Math.min(i, 5) * 0.02}s ease both` }}>
@@ -1448,7 +1661,7 @@ function ThreadCard({ thread, threads, go, i }) {
           </div>
         )}
         {done === null && <div style={{ flex: 1 }} />}
-        <span style={{ fontSize: 10, color: C.text3 }}>{thread.updatedAt}</span>
+        <span style={{ fontSize: 10, color: C.text3 }}>{formatTimestamp(thread.updatedAt)}</span>
       </div>
     </div>
   );
@@ -1489,7 +1702,7 @@ function TimelineView({ threads, go }) {
                   </div>
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ fontSize: 10.5, color: cfg.color, fontWeight: 500, marginBottom: 4 }}>{e.threadTitle}</div>
-                    <div style={{ fontSize: 13.5, color: e.subtype === "note" ? C.text3 : C.entryText, lineHeight: 1.65, fontStyle: e.subtype === "note" ? "italic" : "normal", fontWeight: 300 }}>{e.text}</div>
+                    <div style={{ fontSize: 13.5, color: e.subtype === "note" ? C.text3 : C.entryText, lineHeight: 1.65, fontStyle: e.subtype === "note" ? "italic" : "normal", fontWeight: 300, whiteSpace: "pre-wrap" }}>{e.text}</div>
                   </div>
                   <ChevronRight size={12} color={C.text3} style={{ marginTop: 6, flexShrink: 0 }} />
                 </div>
@@ -1505,7 +1718,73 @@ function TimelineView({ threads, go }) {
 // ─────────────────────────────────────────────────────────────
 // THREAD VIEW
 // ─────────────────────────────────────────────────────────────
-function ThreadView({ thread, threads, go, setShowNew, addEntry, updateEntry, toggleCheck, pinEntry, setDueDate, setEntryDate, deleteEntry, moveEntry, reorderEntries, renameThread, setThreadDescription, deleteThread, selectedEntryIds, toggleEntrySelection, showDoneDefault = false }) {
+// ─── DISPLAY MODE TOGGLE (per-thread entry layout) ───
+function DisplayModeToggle({ mode, onChange, accent }) {
+  const modes = [
+    { key: "list",    icon: List,      label: "List view" },
+    { key: "compact", icon: AlignLeft, label: "Compact view" },
+  ];
+  return (
+    <div style={{ display: "flex", gap: 2, background: C.surf2, border: `1px solid ${C.border}`, borderRadius: 8, padding: 2 }}>
+      {modes.map(m => {
+        const on = mode === m.key;
+        const Icon = m.icon;
+        return (
+          <button
+            key={m.key}
+            onClick={() => onChange(m.key)}
+            title={m.label}
+            className="ghost"
+            style={{
+              display: "flex", alignItems: "center", justifyContent: "center",
+              padding: "4px 9px", borderRadius: 6, border: "none", cursor: "pointer",
+              background: on ? accent + "22" : "transparent",
+              color: on ? accent : C.text3, transition: "all 0.15s",
+            }}
+          >
+            <Icon size={12.5} />
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// Sort entries by date. "manual" keeps array order (drag-reorderable); asc = oldest first, desc = newest first.
+function SortOrderToggle({ order, onChange, accent }) {
+  const opts = [
+    { key: "manual", icon: GripVertical, label: "Manual order (drag to reorder)" },
+    { key: "asc",    icon: ArrowUp,      label: "Oldest first" },
+    { key: "desc",   icon: ArrowDown,    label: "Newest first" },
+  ];
+  const active = order === "asc" || order === "desc" ? order : "manual";
+  return (
+    <div style={{ display: "flex", gap: 2, background: C.surf2, border: `1px solid ${C.border}`, borderRadius: 8, padding: 2 }}>
+      {opts.map(o => {
+        const on = active === o.key;
+        const Icon = o.icon;
+        return (
+          <button
+            key={o.key}
+            onClick={() => onChange(o.key)}
+            title={o.label}
+            className="ghost"
+            style={{
+              display: "flex", alignItems: "center", justifyContent: "center",
+              padding: "4px 9px", borderRadius: 6, border: "none", cursor: "pointer",
+              background: on ? accent + "22" : "transparent",
+              color: on ? accent : C.text3, transition: "all 0.15s",
+            }}
+          >
+            <Icon size={12.5} />
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function ThreadView({ thread, threads, go, setShowNew, addEntry, addEntries, updateEntry, toggleCheck, pinEntry, setDueDate, setEntryDate, deleteEntry, moveEntry, reorderEntries, renameThread, setThreadDescription, setThreadDisplayMode, setThreadSortOrder, deleteThread, selectedEntryIds, toggleEntrySelection, showDoneDefault = false }) {
   const cfg      = TYPES[thread.type];
   const Icon     = cfg.icon;
   const isBoard  = thread.type === "board";
@@ -1515,6 +1794,7 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, updateEntry, to
   const [editingId, setEditingId]       = useState(null);
   const [replyingTo, setReplyingTo]     = useState(null);
   const [entrySubtype, setEntrySubtype] = useState("entry");
+  const [showBulk, setShowBulk]         = useState(false);
   const [showDone, setShowDone]         = useState(showDoneDefault);
   const [dragId, setDragId]             = useState(null);
   const [dropId, setDropId]             = useState(null);
@@ -1549,11 +1829,28 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, updateEntry, to
     if (window.confirm(msg)) deleteThread(thread.id);
   };
 
+  const displayMode = thread.displayMode === "compact" ? "compact" : "list";   // per-thread: "list" | "compact"
+  const sortOrder = thread.sortOrder === "asc" || thread.sortOrder === "desc" ? thread.sortOrder : null; // null = manual (array order)
+  const listContainerStyle = { display: "flex", flexDirection: "column" };
+
+  // Date sort: dateISO is authoritative; tie-break by id (creation order). reverse() of the
+  // ascending sort yields desc with ties broken newest-first too.
+  const byField = (field) => (a, b) => {
+    const va = a[field] || "", vb = b[field] || "";
+    if (va !== vb) return va < vb ? -1 : 1;
+    return (Number(a.id) || 0) - (Number(b.id) || 0);
+  };
+  const sortBy = (arr, field) => {
+    if (!sortOrder) return arr;                       // manual: keep array order
+    const asc = [...arr].sort(byField(field));
+    return sortOrder === "desc" ? asc.reverse() : asc;
+  };
+
   const done      = isBoard ? thread.entries.filter(e => e.checked).length : null;
-  const total     = thread.entries.length;
+  const total     = isBoard ? thread.entries.filter(e => e.subtype !== "note").length : thread.entries.length;
   const children  = getChildren(threads, thread.id);
   const ancestors = buildAncestors(threads, thread.id);
-  const otherThreads = threads.filter(t => t.id !== "inbox" && t.id !== thread.id);
+  const otherThreads = threads.filter(t => t.id !== thread.id);
 
   // Build children-of map for reply tree
   const childrenOf = {};
@@ -1569,6 +1866,13 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, updateEntry, to
     addEntry(thread.id, entryText, entrySubtype, replyingTo?.id || null);
     setEntryText(""); setReplyingTo(null);
     taRef.current?.focus();
+  };
+
+  const handleBulkAdd = (raw) => {
+    const items = parseBulkEntries(raw);
+    if (!items.length) return;
+    addEntries(thread.id, items, entrySubtype);
+    setShowBulk(false);
   };
 
   const handleDrop = (targetId) => {
@@ -1592,10 +1896,22 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, updateEntry, to
   let activeEntries = thread.entries.filter(e => !e.parentEntryId);
   let doneEntries   = [];
   if (isBoard) {
-    const pinned   = activeEntries.filter(e => e.pinned && !e.checked);
-    const unpinned = activeEntries.filter(e => !e.pinned && !e.checked);
-    activeEntries  = [...pinned, ...unpinned];
-    doneEntries    = thread.entries.filter(e => e.checked && !e.parentEntryId);
+    const live = activeEntries.filter(e => !e.checked);
+    if (sortOrder) {
+      // Pinned float to the very top, then due-dated tasks, then the rest — each group
+      // sorted by date (due-dated by their dueDate so the nearest deadline leads).
+      const pinned = sortBy(live.filter(e => e.pinned), "dateISO");
+      const due    = sortBy(live.filter(e => !e.pinned && e.dueDate), "dueDate");
+      const rest   = sortBy(live.filter(e => !e.pinned && !e.dueDate), "dateISO");
+      activeEntries = [...pinned, ...due, ...rest];
+    } else {
+      const pinned   = live.filter(e => e.pinned);
+      const unpinned = live.filter(e => !e.pinned);
+      activeEntries  = [...pinned, ...unpinned];
+    }
+    doneEntries = sortBy(thread.entries.filter(e => e.checked && !e.parentEntryId), "dateISO");
+  } else {
+    activeEntries = sortBy(activeEntries, "dateISO");
   }
 
   const sharedEntryProps = {
@@ -1604,7 +1920,7 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, updateEntry, to
     editingId, setEditingId,
     onReply: (entry) => { setReplyingTo(entry); setTimeout(() => taRef.current?.focus(), 0); },
     isBoard, isInbox, otherThreads, moveEntry,
-    childrenOf,
+    childrenOf, layout: displayMode,
     selectedEntryIds, toggleEntrySelection,
   };
 
@@ -1686,6 +2002,10 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, updateEntry, to
                   <span style={{ fontSize: 10.5, color: C.text3 }}>{Math.round((done / total) * 100)}%</span>
                 </div>
               )}
+              <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+                <SortOrderToggle order={sortOrder} onChange={(o) => setThreadSortOrder(thread.id, o)} accent={cfg.color} />
+                <DisplayModeToggle mode={displayMode} onChange={(m) => setThreadDisplayMode(thread.id, m)} accent={cfg.color} />
+              </div>
             </div>
             {!isInbox && (editingDesc ? (
               <textarea
@@ -1744,11 +2064,11 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, updateEntry, to
           </div>
         )}
 
-        <div style={{ display: "flex", flexDirection: "column" }}>
+        <div style={listContainerStyle}>
           {activeEntries.map((e, i) => (
             <EntryTreeNode
               key={e.id} entry={e} i={i} depth={0}
-              draggable={isBoard} dragId={dragId} dropId={dropId}
+              draggable={isBoard && !sortOrder} dragId={dragId} dropId={dropId}
               onDragStart={() => setDragId(e.id)}
               onDragOver={(ev) => { ev.preventDefault(); setDropId(e.id); }}
               onDrop={() => handleDrop(e.id)}
@@ -1765,7 +2085,7 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, updateEntry, to
               {doneEntries.length} completed
             </button>
             {showDone && (
-              <div style={{ opacity: 0.6 }}>
+              <div style={{ opacity: 0.6, ...listContainerStyle }}>
                 {doneEntries.map((e, i) => (
                   <EntryTreeNode key={e.id} entry={e} i={i} depth={0} draggable={false} dragId={null} dropId={null} onDragStart={() => {}} onDragOver={() => {}} onDrop={() => {}} onDragEnd={() => {}} {...sharedEntryProps} />
                 ))}
@@ -1793,6 +2113,9 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, updateEntry, to
           <button className="subtype-toggle" onClick={() => setEntrySubtype("note")} style={{ display: "flex", alignItems: "center", gap: 5, padding: "4px 10px", borderRadius: 6, border: `1px solid ${entrySubtype === "note" ? C.text3 : C.border}`, background: entrySubtype === "note" ? C.overlay : "transparent", cursor: "pointer", color: entrySubtype === "note" ? C.text2 : C.text3, fontSize: 11, fontWeight: 500 }}>
             <AlignLeft size={10} /> Note
           </button>
+          <button className="subtype-toggle" onClick={() => setShowBulk(true)} title="Paste a list — one entry per line" style={{ display: "flex", alignItems: "center", gap: 5, padding: "4px 10px", borderRadius: 6, border: `1px solid ${C.border}`, background: "transparent", cursor: "pointer", color: C.text3, fontSize: 11, fontWeight: 500, marginLeft: "auto" }}>
+            <List size={10} /> Bulk add
+          </button>
         </div>
         <div style={{ display: "flex", gap: 12, alignItems: "stretch" }}>
           <textarea ref={taRef} value={entryText} onChange={e => setEntryText(e.target.value)}
@@ -1805,6 +2128,50 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, updateEntry, to
           </button>
         </div>
         <div style={{ fontSize: 11, color: C.text3, marginTop: 8, paddingLeft: 2 }}>Enter to add · Shift+Enter for new line</div>
+      </div>
+      {showBulk && (
+        <BulkAddModal thread={thread} cfg={cfg} isBoard={isBoard} onAdd={handleBulkAdd} onClose={() => setShowBulk(false)} />
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// BULK ADD MODAL — paste a list, one entry per line
+// ─────────────────────────────────────────────────────────────
+function BulkAddModal({ thread, cfg, isBoard, onAdd, onClose }) {
+  const ref = useRef(null);
+  const [raw, setRaw] = useState("");
+  useEffect(() => { ref.current?.focus(); }, []);
+  const parsed  = parseBulkEntries(raw);
+  const count   = parsed.length;
+  const checked = parsed.filter(p => p.checked).length;
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: C.scrim, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 200, animation: "fadeIn 0.18s ease both", backdropFilter: "blur(6px)" }}>
+      <div onClick={e => e.stopPropagation()} style={{ background: C.modalSurf, border: `1px solid ${C.border}`, borderRadius: 18, padding: "32px", width: 520, animation: "slideIn 0.22s ease both", boxShadow: "0 32px 80px rgba(0,0,0,0.5)" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+          <div style={{ fontFamily: "'Cormorant', serif", fontSize: 24, fontWeight: 400 }}>Bulk add</div>
+          <button className="ghost" onClick={onClose} style={{ background: "transparent", border: "none", cursor: "pointer", padding: 6, borderRadius: 7, display: "flex" }}>
+            <X size={15} color={C.text2} />
+          </button>
+        </div>
+        <div style={{ fontSize: 12.5, color: C.text3, marginBottom: 18, lineHeight: 1.5 }}>
+          Paste a list into <span style={{ color: cfg.color, fontWeight: 500 }}>{thread.title.length > 30 ? thread.title.slice(0, 30) + "…" : thread.title}</span> — one entry per line.
+          Bullets are stripped{isBoard ? "; " : "."}{isBoard && <><code style={{ fontSize: 11.5, color: C.text2 }}>- [x]</code> items are added as done.</>}
+        </div>
+        <textarea ref={ref} value={raw} onChange={e => setRaw(e.target.value)}
+          onKeyDown={e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); onAdd(raw); } }}
+          placeholder={"- [x] First thing\n- [ ] Second thing\n- Third thing"} rows={10}
+          style={{ width: "100%", background: C.surf2, border: `1px solid ${C.border}`, borderRadius: 10, color: C.text, fontSize: 13.5, padding: "13px 16px", marginBottom: 16, fontWeight: 300, resize: "vertical", lineHeight: 1.6, fontFamily: "'DM Sans', sans-serif" }} />
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{ fontSize: 12, color: C.text3, flex: 1 }}>
+            {count === 0 ? "Nothing to add yet" : `${count} ${count === 1 ? "entry" : "entries"}${isBoard && checked ? ` · ${checked} done` : ""}`}
+          </div>
+          <button onClick={onClose} style={{ background: "transparent", border: `1px solid ${C.border}`, borderRadius: 10, color: C.text2, fontSize: 13, padding: "10px 18px", fontWeight: 500, cursor: "pointer" }}>Cancel</button>
+          <button onClick={() => onAdd(raw)} disabled={count === 0} className="gold-btn" style={{ background: count ? C.gold : C.goldDim, border: "none", borderRadius: 10, color: count ? C.onGold : C.text3, fontSize: 13.5, padding: "10px 22px", fontWeight: 600, cursor: count ? "pointer" : "default" }}>
+            Add {count || ""}
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -1836,6 +2203,7 @@ function SubThreadSection({ children, parentThread, go, setShowNew }) {
           const cfg  = TYPES[child.type];
           const Icon = cfg.icon;
           const done = child.type === "board" ? child.entries.filter(e => e.checked).length : null;
+          const childTotal = child.type === "board" ? child.entries.filter(e => e.subtype !== "note").length : child.entries.length;
           return (
             <div key={child.id} className="sub-card" onClick={() => go(child.id)} style={{ background: C.surf2, border: `1px solid ${C.border}`, borderRadius: 12, padding: "16px 18px", animation: `fadeUp 0.22s ${Math.min(i, 5) * 0.02}s ease both` }}>
               <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 10 }}>
@@ -1848,11 +2216,11 @@ function SubThreadSection({ children, parentThread, go, setShowNew }) {
                 <ChevronRight size={12} color={C.text3} flexShrink={0} />
               </div>
               <div style={{ fontSize: 11, color: C.text3 }}>
-                {done !== null ? `${done}/${child.entries.length} done` : `${child.entries.length} entries`}
+                {done !== null ? `${done}/${childTotal} done` : `${child.entries.length} entries`}
               </div>
-              {done !== null && child.entries.length > 0 && (
+              {done !== null && childTotal > 0 && (
                 <div style={{ marginTop: 8, height: 2, background: C.track, borderRadius: 2, overflow: "hidden" }}>
-                  <div style={{ height: "100%", width: `${(done / child.entries.length) * 100}%`, background: cfg.color, opacity: 0.7 }} />
+                  <div style={{ height: "100%", width: `${(done / childTotal) * 100}%`, background: cfg.color, opacity: 0.7 }} />
                 </div>
               )}
             </div>
@@ -1864,28 +2232,42 @@ function SubThreadSection({ children, parentThread, go, setShowNew }) {
 }
 
 // ─── ENTRY TREE NODE (recursive) ───
-function EntryTreeNode({ entry, depth, i, childrenOf, draggable: isDraggable, dragId, dropId, onDragStart, onDragOver, onDrop, onDragEnd, ...rowProps }) {
+function EntryTreeNode({ entry, depth, i, childrenOf, layout = "list", draggable: isDraggable, dragId, dropId, onDragStart, onDragOver, onDrop, onDragEnd, ...rowProps }) {
   const replies = childrenOf[entry.id] || [];
   const lineColor = rowProps.cfg.color;
+  const [collapsed, setCollapsed] = useState(false);
   return (
     <div>
       <EntryRow
-        entry={entry} depth={depth} i={i}
+        entry={entry} depth={depth} i={i} layout={layout}
         draggable={isDraggable && depth === 0} dragId={dragId} dropId={dropId}
         onDragStart={onDragStart} onDragOver={onDragOver} onDrop={onDrop} onDragEnd={onDragEnd}
         {...rowProps}
       />
       {replies.length > 0 && (
-        <div style={{ marginLeft: 28, paddingLeft: 16, borderLeft: `1.5px solid ${lineColor}22`, marginBottom: 2 }}>
-          {replies.map((r, ri) => (
-            <EntryTreeNode
-              key={r.id} entry={r} depth={depth + 1} i={ri}
-              childrenOf={childrenOf}
-              draggable={false} dragId={null} dropId={null}
-              onDragStart={() => {}} onDragOver={() => {}} onDrop={() => {}} onDragEnd={() => {}}
-              {...rowProps}
-            />
-          ))}
+        <div style={{ marginLeft: 28 }}>
+          <button
+            className="ghost"
+            onClick={() => setCollapsed(c => !c)}
+            title={collapsed ? "Show replies" : "Hide replies"}
+            style={{ display: "flex", alignItems: "center", gap: 5, background: "transparent", border: "none", cursor: "pointer", color: C.text3, fontSize: 11, padding: "3px 4px", borderRadius: 5, marginBottom: collapsed ? 4 : 2, fontFamily: "'DM Sans', sans-serif" }}
+          >
+            {collapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
+            {replies.length} {replies.length > 1 ? "replies" : "reply"}
+          </button>
+          {!collapsed && (
+            <div style={{ paddingLeft: 16, borderLeft: `1.5px solid ${lineColor}22`, marginBottom: 2 }}>
+              {replies.map((r, ri) => (
+                <EntryTreeNode
+                  key={r.id} entry={r} depth={depth + 1} i={ri}
+                  childrenOf={childrenOf} layout={layout}
+                  draggable={false} dragId={null} dropId={null}
+                  onDragStart={() => {}} onDragOver={() => {}} onDrop={() => {}} onDragEnd={() => {}}
+                  {...rowProps}
+                />
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -1893,14 +2275,30 @@ function EntryTreeNode({ entry, depth, i, childrenOf, draggable: isDraggable, dr
 }
 
 // ─── ENTRY ROW ───
-function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, setDueDate, setEntryDate, deleteEntry, updateEntry, editingId, setEditingId, onReply, isBoard, isInbox, otherThreads, moveEntry, draggable: isDraggable, dragId, dropId, onDragStart, onDragOver, onDrop, onDragEnd, i, selectedEntryIds, toggleEntrySelection }) {
+function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, setDueDate, setEntryDate, deleteEntry, updateEntry, editingId, setEditingId, onReply, isBoard, isInbox, otherThreads, moveEntry, layout = "list", draggable: isDraggable, dragId, dropId, onDragStart, onDragOver, onDrop, onDragEnd, i, selectedEntryIds, toggleEntrySelection }) {
   const [editText, setEditText] = useState(entry.text);
+  const [moveOpen, setMoveOpen] = useState(false);
   const editRef  = useRef(null);
+  const moveRef  = useRef(null);
   const dateInputRef = useRef(null);
   const entryDateInputRef = useRef(null);
+
+  useEffect(() => {
+    if (!moveOpen) return;
+    const onDocClick = (e) => { if (!moveRef.current?.contains(e.target)) setMoveOpen(false); };
+    const onKey = (e) => { if (e.key === "Escape") setMoveOpen(false); };
+    document.addEventListener("mousedown", onDocClick);
+    document.addEventListener("keydown", onKey);
+    return () => { document.removeEventListener("mousedown", onDocClick); document.removeEventListener("keydown", onKey); };
+  }, [moveOpen]);
   const isEditing  = editingId === entry.id;
   const isDragOver = dropId === entry.id && dragId !== entry.id;
   const isNote     = entry.subtype === "note";
+  // Notes are plain text regardless of thread type — no checkbox/pin/due, even in a board.
+  const isBoardEntry = isBoard && !isNote;
+  const isCompact  = layout === "compact";
+  // Compact hides the date/note meta line for plain entries; keep it where it carries info.
+  const showMeta   = !isCompact || isBoardEntry || isNote || !!entry.dueDate || !!entry.pinned;
   const isSelected = selectedEntryIds?.has(entry.id);
   const dueDiff    = dueDayDiff(entry.dueDate);
   const dueColor   = entry.checked
@@ -1968,7 +2366,8 @@ function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, setDueDat
       onMouseDown={handleRowMouseDown}
       onClick={handleRowClick}
       style={{
-        display: "flex", gap: 12, padding: "14px 8px",
+        display: "flex", gap: isCompact ? 9 : 12,
+        padding: isCompact ? "7px 8px" : "14px 8px",
         borderBottom: `1px solid ${C.divider}`,
         alignItems: "flex-start", position: "relative",
         animation: `fadeUp 0.18s ${Math.min(i, 6) * 0.012}s ease both`,
@@ -1980,7 +2379,7 @@ function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, setDueDat
           <GripVertical size={13} />
         </div>
       )}
-      {isBoard ? (
+      {isBoardEntry ? (
         <button className="chk" onClick={() => toggleCheck(threadId, entry.id)} style={{ width: 17, height: 17, borderRadius: 5, border: `1.5px solid ${entry.checked ? cfg.color : C.chkBorder}`, background: entry.checked ? cfg.bg : "transparent", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0, marginTop: 3, transition: "all 0.14s" }}>
           {entry.checked && <Check size={9} color={cfg.color} strokeWidth={2.5} />}
         </button>
@@ -2002,7 +2401,8 @@ function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, setDueDat
           </div>
         ) : (
           <>
-            <div onClick={beginEdit} title="Click to edit" style={{ fontSize: 13.5, color: entry.checked ? C.text3 : (isNote ? C.text2 : C.entryText), lineHeight: 1.72, textDecoration: entry.checked ? "line-through" : "none", fontWeight: 300, fontStyle: isNote ? "italic" : "normal", cursor: "text" }}>{entry.text}</div>
+            <div onClick={beginEdit} title="Click to edit" style={{ fontSize: 13.5, color: entry.checked ? C.text3 : (isNote ? C.text2 : C.entryText), lineHeight: isCompact ? 1.5 : 1.72, textDecoration: entry.checked ? "line-through" : "none", fontWeight: 300, fontStyle: isNote ? "italic" : "normal", cursor: "text", whiteSpace: "pre-wrap" }}>{entry.text}</div>
+            {showMeta && (
             <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 6, flexWrap: "wrap" }}>
               <span style={{ position: "relative", display: "inline-flex", alignItems: "center" }}>
                 <span
@@ -2039,14 +2439,15 @@ function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, setDueDat
                 </span>
               )}
             </div>
+            )}
           </>
         )}
-        {isInbox && !isEditing && (
+        {isInbox && !isEditing && otherThreads.length > 0 && (
           <div style={{ marginTop: 10 }}>
-            <select className="move-select" onChange={e => { if (e.target.value) { moveEntry(threadId, entry.id, e.target.value); e.target.value = ""; } }}
+            <select className="move-select" value="" onChange={e => { if (e.target.value) { moveEntry(threadId, entry.id, e.target.value); e.target.value = ""; } }}
               style={{ background: C.surf2, border: `1px solid ${C.border}`, borderRadius: 7, color: C.text2, fontSize: 11.5, padding: "5px 10px", cursor: "pointer" }}>
               <option value="">Move to thread...</option>
-              {otherThreads.map(t => <option key={t.id} value={t.id}>{t.title.length > 40 ? t.title.slice(0, 40) + "..." : t.title}</option>)}
+              {otherThreads.map(t => <option key={t.id} value={t.id}>{t.id === "inbox" ? "Inbox" : (t.title.length > 40 ? t.title.slice(0, 40) + "..." : t.title)}</option>)}
             </select>
           </div>
         )}
@@ -2058,12 +2459,12 @@ function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, setDueDat
               <CornerDownRight size={12} color={C.text3} />
             </button>
           )}
-          {isBoard && (
+          {isBoardEntry && (
             <button className="ghost" onClick={() => pinEntry(threadId, entry.id)} style={{ background: "transparent", border: "none", cursor: "pointer", padding: 5, borderRadius: 5, display: "flex" }}>
               <Pin size={12} color={entry.pinned ? C.gold : C.text3} />
             </button>
           )}
-          {isBoard && (
+          {isBoardEntry && (
             <span style={{ position: "relative", display: "inline-flex" }}>
               <button
                 className="ghost"
@@ -2082,6 +2483,40 @@ function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, setDueDat
                 tabIndex={-1}
                 aria-hidden="true"
               />
+            </span>
+          )}
+          {!isInbox && otherThreads.length > 0 && (
+            <span ref={moveRef} style={{ position: "relative", display: "inline-flex" }}>
+              <button
+                className="ghost"
+                onClick={() => setMoveOpen(o => !o)}
+                title="Move to another thread"
+                style={{ background: "transparent", border: "none", cursor: "pointer", padding: 5, borderRadius: 5, display: "flex" }}
+              >
+                <FolderInput size={12} color={moveOpen ? C.gold : C.text3} />
+              </button>
+              {moveOpen && (
+                <div
+                  style={{
+                    position: "absolute", right: 0, bottom: "calc(100% + 6px)", zIndex: 200,
+                    background: C.surf2, border: `1px solid ${C.border}`, borderRadius: 9,
+                    boxShadow: "0 10px 28px rgba(0,0,0,0.4)", padding: 5, minWidth: 180,
+                    maxHeight: 280, overflowY: "auto",
+                  }}
+                >
+                  <div style={{ fontSize: 10.5, color: C.text3, padding: "4px 8px 6px", textTransform: "uppercase", letterSpacing: "0.05em" }}>Move to</div>
+                  {otherThreads.map(t => (
+                    <button
+                      key={t.id}
+                      className="ghost"
+                      onClick={() => { moveEntry(threadId, entry.id, t.id); setMoveOpen(false); }}
+                      style={{ display: "block", width: "100%", textAlign: "left", background: "transparent", border: "none", color: C.text2, fontSize: 12.5, padding: "6px 8px", borderRadius: 6, cursor: "pointer", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
+                    >
+                      {t.id === "inbox" ? "Inbox" : t.title}
+                    </button>
+                  ))}
+                </div>
+              )}
             </span>
           )}
           <button className="ghost" onClick={() => deleteEntry(threadId, entry.id)} style={{ background: "transparent", border: "none", cursor: "pointer", padding: 5, borderRadius: 5, display: "flex" }}>

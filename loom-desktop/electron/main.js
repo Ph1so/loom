@@ -16,6 +16,11 @@ function localISO(d) {
   return `${y}-${m}-${day}`;
 }
 
+// Real wall-clock timestamp (mirrors nowISO in src/App.jsx).
+function nowISO() {
+  return new Date().toISOString();
+}
+
 function readSavedTheme() {
   try {
     if (fs.existsSync(dataPath)) {
@@ -104,7 +109,7 @@ ipcMain.handle("quick-capture", (event, text) => {
     }
     let inbox = data.threads.find(t => t.id === "inbox");
     if (!inbox) {
-      inbox = { id: "inbox", type: "capture", title: "Inbox", special: "inbox", parentId: null, createdAt: "Today", updatedAt: "Today", entries: [] };
+      inbox = { id: "inbox", type: "capture", title: "Inbox", special: "inbox", parentId: null, createdAt: nowISO(), updatedAt: nowISO(), entries: [] };
       data.threads.unshift(inbox);
     }
     if (!Array.isArray(inbox.entries)) inbox.entries = [];
@@ -114,13 +119,14 @@ ipcMain.handle("quick-capture", (event, text) => {
       dateISO: localISO(new Date()),
       date: "Today",
       ts: 0,
+      createdAt: nowISO(),
       checked: false,
       pinned: false,
       subtype: "entry",
       parentEntryId: null,
     };
     inbox.entries.push(entry);
-    inbox.updatedAt = "Today";
+    inbox.updatedAt = nowISO();
     fs.writeFileSync(dataPath, JSON.stringify(data, null, 2), "utf8");
 
     // Refresh any open window (main app) so the entry shows up live.
