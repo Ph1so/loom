@@ -4,7 +4,7 @@ import {
   LayoutGrid, Feather, Zap, Clock, Pin, CornerDownRight, ChevronDown,
   ChevronRight, Inbox, GripVertical, AlignLeft, List,
   AlertCircle, BookOpen, FolderOpen, Folder, Trash2, Settings, Sun, Moon,
-  Calendar, FolderInput, ExternalLink, ArrowUp, ArrowDown
+  Calendar, FolderInput, ArrowUp, ArrowDown, ClipboardList, FileText
 } from "lucide-react";
 import { buildExportMarkdown } from "./export.js";
 import { PALETTES } from "./palette.js";
@@ -38,7 +38,6 @@ const G = `
   .add-new:hover { border-color: rgba(255,255,255,0.18) !important; background: rgba(255,255,255,0.02) !important; }
   .attn-card { transition: background 0.16s, border-color 0.16s; cursor: pointer; }
   .attn-card:hover { background: #1C1A15 !important; border-color: rgba(255,255,255,0.12) !important; }
-  .drag-over { border-color: rgba(200,165,100,0.4) !important; background: rgba(200,165,100,0.04) !important; }
   .subtype-toggle { transition: all 0.13s; }
   .subtype-toggle:hover { background: rgba(255,255,255,0.06) !important; }
   .move-select { appearance: none; -webkit-appearance: none; }
@@ -160,23 +159,132 @@ function localISO(d) {
   return `${y}-${m}-${day}`;
 }
 
-// ISO date of the Sunday that starts the week containing `d` (local).
-// Used as the key for the weekly form reminder: the reminder is "active"
-// for a given week until the user marks that week's Sunday done.
-function weekStartSunday(d = new Date()) {
-  const x = new Date(d);
-  x.setHours(0, 0, 0, 0);
-  x.setDate(x.getDate() - x.getDay()); // getDay() === 0 on Sunday
-  return localISO(x);
+// ─────────────────────────────────────────────────────────────
+// FORMS — registries + scheduling/answer helpers
+// ─────────────────────────────────────────────────────────────
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+// Question type registry. `hasOptions` → carries an options[] list;
+// `isScale` → carries numeric min/max rendered as a rating row.
+const QTYPES = {
+  short_text:    { label: "Short text" },
+  long_text:     { label: "Paragraph" },
+  single_select: { label: "Multiple choice", hasOptions: true },
+  multi_select:  { label: "Checkboxes",      hasOptions: true },
+  number:        { label: "Number" },
+  scale:         { label: "Rating scale",    isScale: true },
+};
+
+// How a submission's answers become entries.
+const GROUPINGS = {
+  "single":         { label: "One entry",      hint: "All answers in a single entry" },
+  "parent-replies": { label: "Entry + replies", hint: "One entry; each answer a reply beneath it" },
+  "per-question":   { label: "Per question",   hint: "Each answer its own entry — route individually" },
+};
+
+function daysInMonth(d) {
+  return new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
 }
 
-// The hardcoded weekly check-in reminder. Surfaces on Home every week
-// (starting Sunday) and only disappears once marked done for that week.
-const FORM_REMINDER = {
-  url: "https://forms.gle/whrFx6J4wjgf3RaMA",
-  title: "Weekly check-in",
-  blurb: "Fill out this week's form",
-};
+// Is `now` at or past "HH:MM" local time today?
+function isPastTimeToday(hhmm, now) {
+  const [h, m] = String(hhmm || "00:00").split(":").map(Number);
+  return now.getHours() * 60 + now.getMinutes() >= (h || 0) * 60 + (m || 0);
+}
+
+// The current occurrence key (an ISO date) for a scheduled form, or null when
+// it isn't active yet (no schedule, or before the scheduled day/time). Compared
+// against form.lastCompleted to decide due-ness. Reuses localISO as the key.
+function formOccurrence(form, now = new Date()) {
+  const s = form?.schedule;
+  if (!s) return null;
+  const today = new Date(now); today.setHours(0, 0, 0, 0);
+  if (s.cadence === "daily") {
+    return isPastTimeToday(s.time, now) ? localISO(today) : null;
+  }
+  if (s.cadence === "weekly") {
+    const days = (s.daysOfWeek && s.daysOfWeek.length) ? s.daysOfWeek : [0];
+    for (let back = 0; back < 7; back++) {                 // most recent scheduled weekday <= today
+      const d = new Date(today); d.setDate(d.getDate() - back);
+      if (days.includes(d.getDay())) {
+        if (back === 0 && !isPastTimeToday(s.time, now)) return null; // today, but before the time
+        return localISO(d);
+      }
+    }
+    return null;
+  }
+  if (s.cadence === "monthly") {
+    const dom = Math.min(Math.max(1, s.dayOfMonth || 1), daysInMonth(today)); // clamp 31 → month length
+    const scheduled = new Date(today.getFullYear(), today.getMonth(), dom);
+    if (today < scheduled) return null;
+    if (today.getTime() === scheduled.getTime() && !isPastTimeToday(s.time, now)) return null;
+    return localISO(scheduled);
+  }
+  return null;
+}
+
+// Due = there's a current occurrence the user hasn't yet filled or skipped.
+// Only the latest period is tracked (a missed occurrence doesn't stack).
+function formIsDue(form, now = new Date()) {
+  const occ = formOccurrence(form, now);
+  return occ !== null && occ !== form.lastCompleted;
+}
+
+// Human summary of a schedule, e.g. "Weekly · Mon, Thu · 18:00".
+function formScheduleSummary(form) {
+  const s = form?.schedule;
+  if (!s) return "No schedule — fill manually";
+  const t = s.time || "09:00";
+  if (s.cadence === "daily")  return `Daily · ${t}`;
+  if (s.cadence === "weekly") {
+    const days = (s.daysOfWeek && s.daysOfWeek.length) ? s.daysOfWeek : [0];
+    return `Weekly · ${[...days].sort((a, b) => a - b).map(d => WEEKDAYS[d]).join(", ")} · ${t}`;
+  }
+  if (s.cadence === "monthly") return `Monthly · day ${Math.min(Math.max(1, s.dayOfMonth || 1), 31)} · ${t}`;
+  return "No schedule";
+}
+
+// Is a question's answer present? Explicit so a numeric 0 counts as answered.
+function isAnswered(q, val) {
+  if (val === undefined || val === null) return false;
+  if (q.type === "multi_select")          return Array.isArray(val) && val.length > 0;
+  if (q.type === "number" || q.type === "scale") return val !== "" && !Number.isNaN(Number(val));
+  return String(val).trim() !== "";
+}
+
+// Render an answer value to display text.
+function formatAnswer(q, val) {
+  if (q.type === "multi_select") return Array.isArray(val) ? val.join(", ") : "";
+  return String(val ?? "").trim();
+}
+
+// One "Question: answer" line (or bare answer when labels are off).
+function answerLine(form, q, val) {
+  const a = formatAnswer(q, val);
+  return form.includeQuestionLabel ? `${q.label}: ${a}` : a;
+}
+
+// Where a question's answer is written — per-question override (per-question
+// grouping only) → form default → Inbox, skipping any deleted thread so an
+// answer is never silently dropped.
+function resolveQuestionThreadId(form, q, threads) {
+  const exists = (id) => id && threads.some(t => t.id === id);
+  const perQ = form.grouping === "per-question" ? q.threadId : null;
+  if (exists(perQ)) return perQ;
+  if (exists(form.defaultThreadId)) return form.defaultThreadId;
+  return "inbox";
+}
+
+// A fresh, valid blank form for the editor's "new" state.
+function blankForm() {
+  return {
+    id: null, title: "", description: "", questions: [],
+    defaultThreadId: "inbox", grouping: "single", includeQuestionLabel: true,
+    headerTemplate: "",
+    schedule: { cadence: "weekly", daysOfWeek: [0], dayOfMonth: 1, time: "09:00" },
+    lastCompleted: null,
+  };
+}
 
 // Parse pasted multi-line text into entries, one per non-empty line.
 // Understands markdown bullets/numbers and `- [x]` / `- [ ]` checkboxes.
@@ -255,7 +363,6 @@ const DEFAULT_PREFS = {
   density: "comfortable",      // "comfortable" | "compact"
   startupView: "home",         // "home" | "timeline" | "inbox" | "last"
   showDoneByDefault: false,    // initial value of ThreadView's showDone
-  formReminderDoneWeek: null,  // ISO Sunday of the last week the form reminder was cleared
 };
 
 function loadInitialPrefs() {
@@ -293,6 +400,9 @@ export default function Loom() {
     catch { return "dark"; }
   });
   const [showSettings, setShowSettings] = useState(false);
+  const [forms, setForms]             = useState([]);
+  const [editingForm, setEditingForm] = useState(null);  // null | "new" | formId
+  const [fillingForm, setFillingForm] = useState(null);  // null | formId
 
   // Make the active palette visible to every child component (read at render time).
   C = PALETTES[theme] || PALETTES.dark;
@@ -316,12 +426,17 @@ export default function Loom() {
       window.loomAPI.loadData().then(data => {
         if (data && Array.isArray(data.threads) && data.threads.length > 0) {
           setThreads(data.threads);
+          // Start with every thread collapsed on launch.
+          setCollapsed(new Set(data.threads.map(t => t.id)));
         }
         if (data?.theme === "dark" || data?.theme === "light") {
           setTheme(data.theme);
         }
         if (data?.prefs && typeof data.prefs === "object") {
           setPrefs(p => ({ ...p, ...data.prefs }));
+        }
+        if (Array.isArray(data?.forms)) {
+          setForms(data.forms);
         }
         setDataLoaded(true);
       }).catch(() => setDataLoaded(true));
@@ -332,9 +447,9 @@ export default function Loom() {
 
   useEffect(() => {
     if (dataLoaded && window.loomAPI) {
-      window.loomAPI.saveData({ threads, theme, prefs });
+      window.loomAPI.saveData({ threads, theme, prefs, forms });
     }
-  }, [threads, theme, prefs, dataLoaded]);
+  }, [threads, theme, prefs, forms, dataLoaded]);
 
   // The widget captures into the data file directly (via the main process), then
   // broadcasts "data-changed". Reload threads so those captures appear live.
@@ -356,6 +471,17 @@ export default function Loom() {
   const current     = threads.find(t => t.id === view);
   const inboxThread = threads.find(t => t.id === "inbox");
   const inboxCount  = inboxThread ? inboxThread.entries.length : 0;
+
+  // Home red alert: overdue board tasks + forms due to be filled out.
+  const overdueCount = threads
+    .filter(t => t.type === "board" && t.id !== "inbox")
+    .reduce((n, t) => n + t.entries.filter(e => {
+      if (e.checked || e.subtype === "note" || !e.dueDate) return false;
+      const diff = dueDayDiff(e.dueDate);
+      return diff !== null && diff < 0;
+    }).length, 0);
+  const dueFormsCount = forms.filter(f => formIsDue(f)).length;
+  const homeAlertCount = overdueCount + dueFormsCount;
 
   const go = (id) => { if (id !== view) setView(id); };
 
@@ -443,6 +569,92 @@ export default function Loom() {
       createdAt: created, checked: !!it.checked, pinned: false, subtype: subtype || "entry", parentEntryId: null,
     }));
     setThreads(p => p.map(t => t.id === tid ? touchThread({ ...t, entries: [...t.entries, ...newEntries] }) : t));
+  };
+
+  // ── Forms CRUD + submission ────────────────────────────────
+  const createForm = (draft) => {
+    const id = Date.now().toString();
+    const ts = nowISO();
+    setForms(prev => [...prev, { ...draft, id, lastCompleted: null, createdAt: ts, updatedAt: ts }]);
+  };
+
+  const updateForm = (id, draft) => {
+    setForms(prev => prev.map(f => f.id === id ? { ...f, ...draft, id, updatedAt: nowISO() } : f));
+  };
+
+  const deleteForm = (id) => setForms(prev => prev.filter(f => f.id !== id));
+
+  // Skip the current occurrence: mark it complete without writing entries.
+  const skipForm = (form) => {
+    const occ = formOccurrence(form, new Date()) || localISO(new Date());
+    setForms(prev => prev.map(f => f.id === form.id ? { ...f, lastCompleted: occ } : f));
+  };
+
+  // Write a submission's answers as entries per the form's grouping in ONE
+  // threads write, then mark the occurrence complete. A single monotonic id
+  // counter guarantees a parent's id exists before its replies and that ids
+  // never collide across destination threads.
+  const submitFormResponse = (form, answers) => {
+    const base = Date.now();
+    let n = 0;
+    const nextId  = () => (base + (n++)).toString();
+    const dateISO = localISO(new Date());
+    const created = nowISO();
+    const mkEntry = (text, subtype, parentEntryId) => ({
+      id: nextId(), text, dateISO, date: "Today", ts: 0, createdAt: created,
+      checked: false, pinned: false, subtype: subtype || "entry", parentEntryId: parentEntryId || null,
+    });
+
+    const answered = form.questions.filter(q => isAnswered(q, answers[q.id]));
+    const writes = []; // { threadId, entry } — built in question order
+
+    if (form.grouping === "parent-replies") {
+      const tid = resolveQuestionThreadId(form, {}, threads);
+      const bodyQs  = answered.filter(q => q.placement === "body");
+      const replyQs = answered.filter(q => q.placement !== "body");
+      // Body questions write raw (a freeform journal paragraph); header prefixes if set.
+      // Falls back to header/title when no body question is answered (back-compat).
+      const bodyText = [form.headerTemplate?.trim(), ...bodyQs.map(q => formatAnswer(q, answers[q.id]))]
+        .filter(Boolean).join("\n") || form.title || "Form response";
+      const parent = mkEntry(bodyText, "entry", null);
+      writes.push({ threadId: tid, entry: parent });
+      // Group reply questions: questions sharing a non-empty replyGroup combine into ONE
+      // reply (each a labeled line), positioned where the group first appears. Blank group
+      // → its own reply.
+      const groups = []; const byKey = new Map();
+      replyQs.forEach(q => {
+        const key = (q.replyGroup || "").trim();
+        if (key && byKey.has(key)) byKey.get(key).push(q);
+        else { const g = [q]; groups.push(g); if (key) byKey.set(key, g); }
+      });
+      groups.forEach(g => {
+        const text = g.map(q => answerLine(form, q, answers[q.id])).join("\n");
+        if (text.trim()) writes.push({ threadId: tid, entry: mkEntry(text, "entry", parent.id) });
+      });
+    } else if (form.grouping === "per-question") {
+      answered.forEach(q => {
+        const tid = resolveQuestionThreadId(form, q, threads);
+        writes.push({ threadId: tid, entry: mkEntry(answerLine(form, q, answers[q.id]), q.subtype || "entry", null) });
+      });
+    } else { // "single"
+      const body = [form.headerTemplate?.trim(), ...answered.map(q => answerLine(form, q, answers[q.id]))].filter(Boolean).join("\n");
+      if (body) writes.push({ threadId: resolveQuestionThreadId(form, {}, threads), entry: mkEntry(body, "entry", null) });
+    }
+
+    if (writes.length) {
+      const byThread = new Map();
+      writes.forEach(w => {
+        if (!byThread.has(w.threadId)) byThread.set(w.threadId, []);
+        byThread.get(w.threadId).push(w.entry);
+      });
+      setThreads(prev => prev.map(t => {
+        const adds = byThread.get(t.id);
+        return adds && adds.length ? touchThread({ ...t, entries: [...t.entries, ...adds] }) : t;
+      }));
+    }
+
+    const occ = formOccurrence(form, new Date()) || dateISO;
+    setForms(prev => prev.map(f => f.id === form.id ? { ...f, lastCompleted: occ } : f));
   };
 
   const updateEntry = (tid, eid, text) => {
@@ -669,7 +881,7 @@ export default function Loom() {
         <Sidebar
           threads={threads} filtered={filtered} rootThreads={rootThreads}
           view={view} go={go} search={search} setSearch={setSearch}
-          setShowNew={setShowNew} inboxCount={inboxCount}
+          setShowNew={setShowNew} inboxCount={inboxCount} homeAlertCount={homeAlertCount}
           collapsed={collapsed} toggleCollapse={toggleCollapse}
           dragState={dragState}
           startThreadDrag={startThreadDrag}
@@ -682,9 +894,10 @@ export default function Loom() {
           clearSelection={clearSelection}
         />
         <main style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
-          {view === "home"     && <HomeView     threads={threads} rootThreads={rootThreads} go={go} setShowNew={setShowNew} addEntry={addEntry} prefs={prefs} setPrefs={setPrefs} />}
+          {view === "home"     && <HomeView     threads={threads} rootThreads={rootThreads} go={go} setShowNew={setShowNew} addEntry={addEntry} forms={forms} onFillForm={setFillingForm} onSkipForm={skipForm} />}
           {view === "timeline" && <TimelineView threads={threads} go={go} />}
-          {current && view !== "home" && view !== "timeline" && (
+          {view === "forms"    && <FormsView    forms={forms} threads={threads} onNew={() => setEditingForm("new")} onEdit={setEditingForm} onFill={setFillingForm} onDelete={deleteForm} />}
+          {current && view !== "home" && view !== "timeline" && view !== "forms" && (
             <ThreadView
               key={current.id} thread={current} threads={threads} go={go}
               setShowNew={setShowNew}
@@ -722,6 +935,22 @@ export default function Loom() {
             setPrefs={setPrefs}
             threads={threads}
             onClose={() => setShowSettings(false)}
+          />
+        )}
+        {editingForm && (
+          <FormEditor
+            form={editingForm === "new" ? null : forms.find(f => f.id === editingForm)}
+            threads={threads}
+            onSave={(draft) => { editingForm === "new" ? createForm(draft) : updateForm(editingForm, draft); setEditingForm(null); }}
+            onClose={() => setEditingForm(null)}
+          />
+        )}
+        {fillingForm && forms.find(f => f.id === fillingForm) && (
+          <FormFill
+            form={forms.find(f => f.id === fillingForm)}
+            threads={threads}
+            onSubmit={(answers) => { submitFormResponse(forms.find(f => f.id === fillingForm), answers); setFillingForm(null); }}
+            onClose={() => setFillingForm(null)}
           />
         )}
       </div>
@@ -1187,10 +1416,17 @@ function SettingsModal({ theme, setTheme, prefs, setPrefs, threads, onClose }) {
 
         {widgetCfg && (
           <SettingsSection label="Quick Capture Widget">
-            <SettingsRow label="Show widget on desktop" hint="A small always-available box for capturing thoughts straight to Inbox">
+            <SettingsRow label="Show widget on desktop" hint="A small always-available box for capturing thoughts straight to Inbox. Also summoned by the global shortcut.">
               <ToggleSwitch
                 checked={!!widgetCfg.visible}
                 onChange={(v) => setWidget({ visible: v })}
+              />
+            </SettingsRow>
+
+            <SettingsRow label="Open widget on launch" hint="Automatically show the widget when Loom starts. Off by default — otherwise use the global shortcut to summon it.">
+              <ToggleSwitch
+                checked={!!widgetCfg.openOnLaunch}
+                onChange={(v) => setWidget({ openOnLaunch: v })}
               />
             </SettingsRow>
 
@@ -1251,7 +1487,7 @@ function SettingsModal({ theme, setTheme, prefs, setPrefs, threads, onClose }) {
 // ─────────────────────────────────────────────────────────────
 // SIDEBAR
 // ─────────────────────────────────────────────────────────────
-function Sidebar({ threads, filtered, rootThreads, view, go, search, setSearch, setShowNew, inboxCount, collapsed, toggleCollapse, dragState, startThreadDrag, endThreadDrag, updateDropTarget, handleThreadDrop, openSettings, selectedThreadIds, toggleThreadSelection, clearSelection }) {
+function Sidebar({ threads, filtered, rootThreads, view, go, search, setSearch, setShowNew, inboxCount, homeAlertCount, collapsed, toggleCollapse, dragState, startThreadDrag, endThreadDrag, updateDropTarget, handleThreadDrop, openSettings, selectedThreadIds, toggleThreadSelection, clearSelection }) {
   const isDragging    = !!dragState.dragging;
   const isRootTarget  = dragState.target?.position === "root";
 
@@ -1270,9 +1506,10 @@ function Sidebar({ threads, filtered, rootThreads, view, go, search, setSearch, 
       </div>
 
       <div style={{ padding: "2px 10px 0", flexShrink: 0 }}>
-        <SbItem icon={Zap}   label="Home"     active={view === "home"}     onClick={() => go("home")} />
+        <SbItem icon={Zap}   label="Home"     active={view === "home"}     onClick={() => go("home")} badge={homeAlertCount} badgeColor="#D67878" badgeBg="rgba(214,120,120,0.16)" />
         <SbItem icon={Clock} label="Timeline" active={view === "timeline"} onClick={() => go("timeline")} />
         <SbItem icon={Inbox} label="Inbox"    active={view === "inbox"}    onClick={() => go("inbox")} badge={inboxCount} badgeColor="#9E84BF" />
+        <SbItem icon={FileText} label="Forms" active={view === "forms"}    onClick={() => go("forms")} />
       </div>
 
       <div style={{ flex: 1, overflowY: "auto", padding: "4px 10px 8px" }}>
@@ -1317,14 +1554,14 @@ function Sidebar({ threads, filtered, rootThreads, view, go, search, setSearch, 
   );
 }
 
-function SbItem({ icon: Icon, label, active, onClick, badge, badgeColor }) {
+function SbItem({ icon: Icon, label, active, onClick, badge, badgeColor, badgeBg }) {
   return (
     <div className={`s-item ${active ? "on" : ""}`} onClick={onClick} style={{ padding: "8px 10px", cursor: "pointer", display: "flex", alignItems: "center", gap: 9, marginBottom: 1, justifyContent: "space-between" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
         <Icon size={12} color={active ? C.gold : C.text3} />
         <span style={{ fontSize: 12.5, color: active ? C.text : C.text2, fontWeight: active ? 500 : 400 }}>{label}</span>
       </div>
-      {badge > 0 && <span style={{ fontSize: 10, background: "rgba(158,132,191,0.15)", color: badgeColor || C.gold, padding: "2px 7px", borderRadius: 10, fontWeight: 500 }}>{badge}</span>}
+      {badge > 0 && <span style={{ fontSize: 10, background: badgeBg || "rgba(158,132,191,0.15)", color: badgeColor || C.gold, padding: "2px 7px", borderRadius: 10, fontWeight: 500 }}>{badge}</span>}
     </div>
   );
 }
@@ -1474,11 +1711,8 @@ function SbThreadTree({ thread, allThreads, view, go, depth, collapsed, toggleCo
 // ─────────────────────────────────────────────────────────────
 // HOME VIEW
 // ─────────────────────────────────────────────────────────────
-function HomeView({ threads, rootThreads, go, setShowNew, addEntry, prefs, setPrefs }) {
+function HomeView({ threads, rootThreads, go, setShowNew, addEntry, forms, onFillForm, onSkipForm }) {
   const [capture, setCapture] = useState("");
-  const thisWeek      = weekStartSunday();
-  const showReminder  = prefs.formReminderDoneWeek !== thisWeek;
-  const clearReminder = () => setPrefs(p => ({ ...p, formReminderDoneWeek: thisWeek }));
   const hrs     = new Date().getHours();
   const greet   = hrs < 12 ? "Good morning" : hrs < 17 ? "Good afternoon" : "Good evening";
   const dateStr = new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" });
@@ -1496,7 +1730,7 @@ function HomeView({ threads, rootThreads, go, setShowNew, addEntry, prefs, setPr
         <div style={{ fontSize: 12.5, color: C.text3, marginTop: 8 }}>{dateStr}</div>
       </div>
 
-      {showReminder && <FormReminderCard onDone={clearReminder} />}
+      <FormsDue forms={forms} threads={threads} onFill={onFillForm} onSkip={onSkipForm} />
 
       <SmartSurface threads={rootThreads} allThreads={threads} go={go} />
 
@@ -1528,28 +1762,417 @@ function HomeView({ threads, rootThreads, go, setShowNew, addEntry, prefs, setPr
   );
 }
 
-// Passive weekly nudge on Home. Opens the form externally (routed through
-// shell.openExternal by the main process) and only clears for the week once
-// the user marks it done; it reappears at the next week's Sunday.
-function FormReminderCard({ onDone }) {
+// Passive nudge on Home: one gold card per form whose schedule has come due
+// (and isn't filled/skipped for this occurrence). Fill opens the in-app form;
+// "Skip this time" clears the occurrence without writing entries.
+function FormsDue({ forms, threads, onFill, onSkip }) {
+  const due = (forms || []).filter(f => formIsDue(f, new Date()));
+  if (due.length === 0) return null;
   return (
-    <div style={{ animation: "fadeUp 0.45s 0.02s ease both", marginBottom: 28 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 14, background: C.surf, border: `1px solid ${C.gold}`, borderRadius: 12, padding: "16px 18px" }}>
-        <div style={{ width: 34, height: 34, borderRadius: 8, background: C.goldDim, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
-          <Calendar size={15} color={C.gold} />
+    <div style={{ animation: "fadeUp 0.45s 0.02s ease both", marginBottom: 28, display: "flex", flexDirection: "column", gap: 8 }}>
+      {due.map(f => (
+        <div key={f.id} style={{ display: "flex", alignItems: "center", gap: 14, background: C.surf, border: `1px solid ${C.gold}`, borderRadius: 12, padding: "16px 18px" }}>
+          <div style={{ width: 34, height: 34, borderRadius: 8, background: C.goldDim, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+            <ClipboardList size={15} color={C.gold} />
+          </div>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3 }}>
+              <span style={{ fontSize: 11, color: C.gold, fontWeight: 500 }}>{f.title || "Untitled form"}</span>
+              <span style={{ fontSize: 9.5, fontWeight: 600, color: "#D67878", background: "rgba(214,120,120,0.16)", padding: "2px 7px", borderRadius: 10, display: "flex", alignItems: "center", gap: 4, flexShrink: 0 }}>
+                <AlertCircle size={9} color="#D67878" /> Needs attention
+              </span>
+            </div>
+            <div style={{ fontSize: 12.5, color: C.text2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{formScheduleSummary(f)}</div>
+          </div>
+          <button onClick={() => onFill(f.id)} className="gold-btn"
+            style={{ display: "flex", alignItems: "center", gap: 6, background: C.gold, border: "none", borderRadius: 8, color: C.onGold, fontSize: 12, padding: "8px 14px", cursor: "pointer", fontWeight: 500, flexShrink: 0 }}>
+            <Check size={12} /> Fill out
+          </button>
+          <button onClick={() => onSkip(f)}
+            style={{ background: "transparent", border: `1px solid ${C.border}`, borderRadius: 8, color: C.text3, fontSize: 12, padding: "8px 14px", cursor: "pointer", fontWeight: 500, flexShrink: 0 }}>
+            Skip this time
+          </button>
         </div>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontSize: 11, color: C.gold, fontWeight: 500, marginBottom: 3 }}>{FORM_REMINDER.title}</div>
-          <div style={{ fontSize: 12.5, color: C.text2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{FORM_REMINDER.blurb}</div>
+      ))}
+    </div>
+  );
+}
+
+// The integer steps of a scale question (min..max, capped for sanity).
+function scaleValues(q) {
+  const min = Number.isFinite(Number(q.min)) ? Number(q.min) : 1;
+  const max = Number.isFinite(Number(q.max)) ? Number(q.max) : 5;
+  const lo = Math.min(min, max), hi = Math.max(min, max);
+  const out = [];
+  for (let v = lo; v <= hi && out.length < 21; v++) out.push(v);
+  return out;
+}
+
+// ─────────────────────────────────────────────────────────────
+// FORMS VIEW — manage forms (list, new, edit, fill, delete)
+// ─────────────────────────────────────────────────────────────
+function FormsView({ forms, threads, onNew, onEdit, onFill, onDelete }) {
+  const threadName = (id) => {
+    const t = threads.find(t => t.id === id);
+    return t ? (t.id === "inbox" ? "Inbox" : t.title) : null;
+  };
+  return (
+    <div style={{ height: "100%", overflowY: "auto", padding: "52px 64px 64px" }}>
+      <div style={{ animation: "fadeUp 0.4s ease both", marginBottom: 36, display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: 16 }}>
+        <div>
+          <div style={{ fontFamily: "'Cormorant', serif", fontSize: 36, fontWeight: 300, letterSpacing: "-0.01em" }}>Forms</div>
+          <div style={{ fontSize: 12.5, color: C.text3, marginTop: 6 }}>Recurring check-ins that write answers straight into your threads.</div>
         </div>
-        <button onClick={() => window.open(FORM_REMINDER.url, "_blank")} className="gold-btn"
-          style={{ display: "flex", alignItems: "center", gap: 6, background: C.gold, border: "none", borderRadius: 8, color: C.onGold, fontSize: 12, padding: "8px 14px", cursor: "pointer", fontWeight: 500, flexShrink: 0 }}>
-          <ExternalLink size={12} /> Open form
+        <button onClick={onNew} className="gold-btn" style={{ display: "flex", alignItems: "center", gap: 7, background: C.gold, border: "none", borderRadius: 10, color: C.onGold, fontSize: 13, padding: "10px 16px", cursor: "pointer", fontWeight: 500, flexShrink: 0 }}>
+          <Plus size={14} /> New form
         </button>
-        <button onClick={onDone}
-          style={{ background: "transparent", border: `1px solid ${C.border}`, borderRadius: 8, color: C.text3, fontSize: 12, padding: "8px 14px", cursor: "pointer", fontWeight: 500, flexShrink: 0 }}>
-          Done this week
-        </button>
+      </div>
+
+      {forms.length === 0 ? (
+        <div style={{ animation: "fadeUp 0.4s 0.06s ease both", border: `1.5px dashed ${C.dashed}`, borderRadius: 16, padding: "48px 24px", textAlign: "center", color: C.text3 }}>
+          <ClipboardList size={26} strokeWidth={1.5} style={{ marginBottom: 12, opacity: 0.7 }} />
+          <div style={{ fontSize: 13.5, marginBottom: 6, color: C.text2 }}>No forms yet</div>
+          <div style={{ fontSize: 12, lineHeight: 1.5 }}>Build a form to capture recurring reflections, habit logs, or check-ins.</div>
+        </div>
+      ) : (
+        <div style={{ animation: "fadeUp 0.4s 0.06s ease both", display: "flex", flexDirection: "column", gap: 12 }}>
+          {forms.map((f, i) => {
+            const due = formIsDue(f, new Date());
+            const target = threadName(f.defaultThreadId);
+            return (
+              <div key={f.id} style={{ background: C.surf, border: `1px solid ${due ? C.gold : C.border}`, borderRadius: 14, padding: "18px 22px", animation: `fadeUp 0.24s ${Math.min(i, 6) * 0.02}s ease both` }}>
+                <div style={{ display: "flex", alignItems: "flex-start", gap: 14 }}>
+                  <div style={{ width: 36, height: 36, borderRadius: 9, background: C.goldDim, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                    <ClipboardList size={16} color={C.gold} />
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ fontFamily: "'Cormorant', serif", fontSize: 19, lineHeight: 1.3 }}>{f.title || "Untitled form"}</span>
+                      {due && <span style={{ fontSize: 9.5, color: C.gold, background: C.goldDim, border: `1px solid ${C.goldBorder}`, borderRadius: 5, padding: "2px 6px", fontWeight: 600, letterSpacing: "0.04em", textTransform: "uppercase" }}>Due</span>}
+                    </div>
+                    <div style={{ fontSize: 12, color: C.text3, marginTop: 5, display: "flex", flexWrap: "wrap", gap: "2px 10px" }}>
+                      <span>{f.questions.length} question{f.questions.length === 1 ? "" : "s"}</span>
+                      <span>· {formScheduleSummary(f)}</span>
+                      <span>· {target ? `→ ${target}` : "→ Inbox (thread deleted)"}</span>
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+                    <button onClick={() => onFill(f.id)} className="gold-btn" style={{ background: C.gold, border: "none", borderRadius: 8, color: C.onGold, fontSize: 12, padding: "7px 14px", cursor: "pointer", fontWeight: 500 }}>Fill out</button>
+                    <ActionButton onClick={() => onEdit(f.id)}>Edit</ActionButton>
+                    <button onClick={() => { if (window.confirm(`Delete "${f.title || "Untitled form"}"? This can't be undone.`)) onDelete(f.id); }} className="ghost" style={{ background: "transparent", border: `1px solid ${C.border}`, borderRadius: 7, color: "#D67878", padding: 7, cursor: "pointer", display: "flex" }}>
+                      <Trash2 size={13} />
+                    </button>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// FORM FILL — answer a form; on submit it becomes thread entries
+// ─────────────────────────────────────────────────────────────
+function FormFill({ form, threads, onSubmit, onClose }) {
+  const [answers, setAnswers] = useState({});
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); onClose(); } };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const setAns = (qid, val) => setAnswers(a => ({ ...a, [qid]: val }));
+  const toggleMulti = (qid, opt) => setAnswers(a => {
+    const cur = Array.isArray(a[qid]) ? a[qid] : [];
+    return { ...a, [qid]: cur.includes(opt) ? cur.filter(o => o !== opt) : [...cur, opt] };
+  });
+
+  const submit = () => {
+    const missing = form.questions.find(q => q.required && !isAnswered(q, answers[q.id]));
+    if (missing) { setErr(`"${missing.label || "Untitled question"}" is required.`); return; }
+    onSubmit(answers);
+  };
+
+  const inputStyle = { width: "100%", background: C.surf2, border: `1px solid ${C.border}`, borderRadius: 10, color: C.text, fontSize: 14, padding: "11px 14px", fontWeight: 300 };
+
+  return (
+    <div onClick={e => { e.stopPropagation(); onClose(); }} style={{ position: "fixed", inset: 0, background: C.scrim, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 250, animation: "fadeIn 0.18s ease both", backdropFilter: "blur(6px)" }}>
+      <div onClick={e => e.stopPropagation()} style={{ width: 520, maxWidth: "92vw", maxHeight: "86vh", display: "flex", flexDirection: "column", background: C.surf, border: `1px solid ${C.border}`, borderRadius: 14, animation: "slideIn 0.22s ease both", boxShadow: "0 24px 60px rgba(0,0,0,0.5)" }}>
+        <div style={{ padding: "22px 24px 14px", borderBottom: `1px solid ${C.border}`, flexShrink: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+            <div style={{ fontFamily: "'Cormorant', serif", fontSize: 23, fontWeight: 400 }}>{form.title || "Untitled form"}</div>
+            <button onClick={onClose} className="ghost" style={{ background: "transparent", border: "none", cursor: "pointer", color: C.text3, padding: 6, borderRadius: 6, display: "flex" }}><X size={15} /></button>
+          </div>
+          {form.description && <div style={{ fontSize: 12.5, color: C.text3, lineHeight: 1.5 }}>{form.description}</div>}
+        </div>
+
+        <div style={{ flex: 1, overflowY: "auto", padding: "18px 24px", display: "flex", flexDirection: "column", gap: 20 }}>
+          {form.questions.length === 0 && <div style={{ color: C.text3, fontSize: 12.5, textAlign: "center", padding: 20 }}>This form has no questions.</div>}
+          {form.questions.map(q => {
+            const val = answers[q.id];
+            return (
+              <div key={q.id}>
+                <div style={{ fontSize: 13, color: C.text, fontWeight: 500, marginBottom: 8 }}>
+                  {q.label || "Untitled question"}{q.required && <span style={{ color: "#D67878", marginLeft: 4 }}>*</span>}
+                </div>
+                {q.type === "short_text" && <input value={val || ""} onChange={e => setAns(q.id, e.target.value)} style={inputStyle} />}
+                {q.type === "long_text" && <textarea value={val || ""} onChange={e => setAns(q.id, e.target.value)} rows={3} style={{ ...inputStyle, resize: "none", lineHeight: 1.55 }} />}
+                {q.type === "number" && <input type="number" value={val ?? ""} onChange={e => setAns(q.id, e.target.value)} style={inputStyle} />}
+                {q.type === "single_select" && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+                    {(q.options || []).map(opt => (
+                      <label key={opt} className="ghost" style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 12px", border: `1px solid ${val === opt ? C.goldBorder : C.border}`, background: val === opt ? C.goldDim : "transparent", borderRadius: 9, cursor: "pointer", fontSize: 13, color: val === opt ? C.gold : C.text2 }}>
+                        <input type="radio" name={q.id} checked={val === opt} onChange={() => setAns(q.id, opt)} style={{ accentColor: C.gold }} /> {opt}
+                      </label>
+                    ))}
+                    {(q.options || []).length === 0 && <span style={{ fontSize: 12, color: C.text3 }}>No options.</span>}
+                  </div>
+                )}
+                {q.type === "multi_select" && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+                    {(q.options || []).map(opt => {
+                      const on = Array.isArray(val) && val.includes(opt);
+                      return (
+                        <label key={opt} className="ghost" style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 12px", border: `1px solid ${on ? C.goldBorder : C.border}`, background: on ? C.goldDim : "transparent", borderRadius: 9, cursor: "pointer", fontSize: 13, color: on ? C.gold : C.text2 }}>
+                          <input type="checkbox" checked={on} onChange={() => toggleMulti(q.id, opt)} style={{ accentColor: C.gold }} /> {opt}
+                        </label>
+                      );
+                    })}
+                    {(q.options || []).length === 0 && <span style={{ fontSize: 12, color: C.text3 }}>No options.</span>}
+                  </div>
+                )}
+                {q.type === "scale" && (
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                    {scaleValues(q).map(nv => {
+                      const on = Number(val) === nv;
+                      return <button key={nv} onClick={() => setAns(q.id, nv)} style={{ width: 40, height: 40, borderRadius: 9, border: `1px solid ${on ? C.goldBorder : C.border}`, background: on ? C.gold : "transparent", color: on ? C.onGold : C.text2, fontSize: 13, fontWeight: 500, cursor: "pointer" }}>{nv}</button>;
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        <div style={{ padding: "12px 24px 16px", borderTop: `1px solid ${C.border}`, display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
+          {err && <span style={{ fontSize: 11.5, color: "#E08A8A" }}>{err}</span>}
+          <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+            <ActionButton onClick={onClose}>Cancel</ActionButton>
+            <button onClick={submit} className="gold-btn" style={{ background: C.gold, border: "none", borderRadius: 8, color: C.onGold, fontSize: 12.5, padding: "8px 18px", cursor: "pointer", fontWeight: 500 }}>Submit</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// FORM EDITOR — build/edit a form (local draft, committed on Save)
+// ─────────────────────────────────────────────────────────────
+function FormEditor({ form, threads, onSave, onClose }) {
+  const [draft, setDraft] = useState(() => form ? JSON.parse(JSON.stringify(form)) : blankForm());
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); onClose(); } };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const patch = (p) => setDraft(d => ({ ...d, ...p }));
+  const patchSchedule = (p) => setDraft(d => ({ ...d, schedule: { ...d.schedule, ...p } }));
+  const setQ = (idx, p) => setDraft(d => ({ ...d, questions: d.questions.map((q, i) => i === idx ? { ...q, ...p } : q) }));
+  const addQuestion = () => setDraft(d => ({ ...d, questions: [...d.questions, { id: (Date.now() + d.questions.length).toString(), type: "short_text", label: "", required: false, options: [], min: 1, max: 5, threadId: null, subtype: "entry", placement: "reply", replyGroup: "" }] }));
+  const removeQ = (idx) => setDraft(d => ({ ...d, questions: d.questions.filter((_, i) => i !== idx) }));
+  const moveQ = (idx, dir) => setDraft(d => {
+    const qs = [...d.questions]; const j = idx + dir;
+    if (j < 0 || j >= qs.length) return d;
+    [qs[idx], qs[j]] = [qs[j], qs[idx]];
+    return { ...d, questions: qs };
+  });
+
+  const save = () => {
+    if (!draft.title.trim()) return setErr("Give the form a title.");
+    if (draft.questions.length === 0) return setErr("Add at least one question.");
+    for (const q of draft.questions) {
+      if (!q.label.trim()) return setErr("Every question needs a label.");
+      if (QTYPES[q.type].hasOptions && (q.options || []).filter(o => o.trim()).length === 0) return setErr(`"${q.label}" needs at least one option.`);
+      if (q.type === "scale" && Number(q.max) <= Number(q.min)) return setErr(`"${q.label}" scale max must be greater than min.`);
+    }
+    const clean = {
+      ...draft, title: draft.title.trim(),
+      questions: draft.questions.map(q => ({ ...q, label: q.label.trim(), options: (q.options || []).map(o => o.trim()).filter(Boolean) })),
+    };
+    onSave(clean);
+  };
+
+  const threadOptions = [threads.find(t => t.id === "inbox"), ...threads.filter(t => t.id !== "inbox")].filter(Boolean);
+  const selectStyle = { background: C.surf2, border: `1px solid ${C.border}`, borderRadius: 8, color: C.text2, fontSize: 12.5, padding: "7px 10px", cursor: "pointer" };
+  const inputStyle = { width: "100%", background: C.surf2, border: `1px solid ${C.border}`, borderRadius: 9, color: C.text, fontSize: 13.5, padding: "10px 13px", fontWeight: 300 };
+  const perQuestion = draft.grouping === "per-question";
+
+  return (
+    <div onClick={e => { e.stopPropagation(); onClose(); }} style={{ position: "fixed", inset: 0, background: C.scrim, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 250, animation: "fadeIn 0.18s ease both", backdropFilter: "blur(6px)" }}>
+      <div onClick={e => e.stopPropagation()} style={{ width: 600, maxWidth: "94vw", maxHeight: "90vh", display: "flex", flexDirection: "column", background: C.surf, border: `1px solid ${C.border}`, borderRadius: 14, animation: "slideIn 0.22s ease both", boxShadow: "0 24px 60px rgba(0,0,0,0.5)" }}>
+        <div style={{ padding: "20px 24px 14px", borderBottom: `1px solid ${C.border}`, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <div style={{ fontFamily: "'Cormorant', serif", fontSize: 23, fontWeight: 400 }}>{form ? "Edit form" : "New form"}</div>
+          <button onClick={onClose} className="ghost" style={{ background: "transparent", border: "none", cursor: "pointer", color: C.text3, padding: 6, borderRadius: 6, display: "flex" }}><X size={15} /></button>
+        </div>
+
+        <div style={{ flex: 1, overflowY: "auto", padding: "18px 24px" }}>
+          <input value={draft.title} onChange={e => patch({ title: e.target.value })} placeholder="Form title..." style={{ ...inputStyle, marginBottom: 10 }} />
+          <textarea value={draft.description} onChange={e => patch({ description: e.target.value })} placeholder="Description (optional)..." rows={2} style={{ ...inputStyle, marginBottom: 18, resize: "none", fontStyle: "italic", lineHeight: 1.5 }} />
+
+          <SettingsSection label="Answers → entries">
+            <SettingsRow label="Default thread" hint="Where answers are written (per-question can override below)">
+              <select value={draft.defaultThreadId} onChange={e => patch({ defaultThreadId: e.target.value })} className="move-select" style={selectStyle}>
+                {threadOptions.map(t => <option key={t.id} value={t.id}>{t.id === "inbox" ? "Inbox" : t.title}</option>)}
+              </select>
+            </SettingsRow>
+            <SettingsRow label="Format" hint={GROUPINGS[draft.grouping].hint}>
+              <SegSelect value={draft.grouping} onChange={v => patch({ grouping: v })} options={Object.entries(GROUPINGS).map(([value, g]) => ({ value, label: g.label }))} />
+            </SettingsRow>
+            <SettingsRow label="Prefix answers with the question" hint='e.g. "Mood: 7" vs just "7"'>
+              <ToggleSwitch checked={draft.includeQuestionLabel} onChange={v => patch({ includeQuestionLabel: v })} />
+            </SettingsRow>
+            {!perQuestion && (
+              <SettingsRow label="Header line" hint={draft.grouping === "parent-replies" ? "Prefixes the body (or is the parent if no Body question)" : "First line of the entry"}>
+                <input value={draft.headerTemplate || ""} onChange={e => patch({ headerTemplate: e.target.value })} placeholder={draft.title || "Form response"} style={{ ...selectStyle, color: C.text, width: 180 }} />
+              </SettingsRow>
+            )}
+          </SettingsSection>
+
+          <SettingsSection label="Reminder schedule">
+            <SettingsRow label="Repeat" hint="When this form's card appears on Home">
+              <SegSelect
+                value={draft.schedule ? draft.schedule.cadence : "none"}
+                onChange={v => v === "none"
+                  ? patch({ schedule: null })
+                  : patch({ schedule: { cadence: v, daysOfWeek: draft.schedule?.daysOfWeek || [0], dayOfMonth: draft.schedule?.dayOfMonth || 1, time: draft.schedule?.time || "09:00" } })}
+                options={[{ value: "none", label: "Off" }, { value: "daily", label: "Daily" }, { value: "weekly", label: "Weekly" }, { value: "monthly", label: "Monthly" }]}
+              />
+            </SettingsRow>
+            {draft.schedule?.cadence === "weekly" && (
+              <SettingsRow label="On days">
+                <div style={{ display: "flex", gap: 4 }}>
+                  {WEEKDAYS.map((wd, di) => {
+                    const on = (draft.schedule.daysOfWeek || []).includes(di);
+                    return <button key={di} title={wd} onClick={() => { const set = new Set(draft.schedule.daysOfWeek || []); set.has(di) ? set.delete(di) : set.add(di); patchSchedule({ daysOfWeek: [...set] }); }} style={{ width: 32, height: 30, borderRadius: 7, fontSize: 11, fontWeight: 500, border: `1px solid ${on ? C.goldBorder : C.border}`, background: on ? C.goldDim : "transparent", color: on ? C.gold : C.text3, cursor: "pointer" }}>{wd[0]}</button>;
+                  })}
+                </div>
+              </SettingsRow>
+            )}
+            {draft.schedule?.cadence === "monthly" && (
+              <SettingsRow label="Day of month" hint="1–31 (clamped to the month's length)">
+                <input type="number" min={1} max={31} value={draft.schedule.dayOfMonth} onChange={e => patchSchedule({ dayOfMonth: Math.max(1, Math.min(31, Number(e.target.value) || 1)) })} style={{ ...selectStyle, color: C.text, width: 64 }} />
+              </SettingsRow>
+            )}
+            {draft.schedule && (
+              <SettingsRow label="Time of day" hint="It surfaces at/after this time">
+                <input type="time" value={draft.schedule.time} onChange={e => patchSchedule({ time: e.target.value })} style={{ ...selectStyle, color: C.text }} />
+              </SettingsRow>
+            )}
+          </SettingsSection>
+
+          <div style={{ marginBottom: 10, fontSize: 10.5, color: C.text3, letterSpacing: "0.10em", textTransform: "uppercase", fontWeight: 500 }}>Questions</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {draft.questions.map((q, idx) => (
+              <QuestionEditor key={q.id} q={q} idx={idx} total={draft.questions.length} grouping={draft.grouping} threadOptions={threadOptions}
+                onChange={(p) => setQ(idx, p)} onMove={(dir) => moveQ(idx, dir)} onRemove={() => removeQ(idx)} inputStyle={inputStyle} selectStyle={selectStyle} />
+            ))}
+          </div>
+          <button onClick={addQuestion} className="ghost" style={{ marginTop: 10, width: "100%", border: `1.5px dashed ${C.dashed}`, borderRadius: 10, padding: "12px", color: C.text3, fontSize: 12.5, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8, background: "transparent" }}>
+            <Plus size={14} /> Add question
+          </button>
+        </div>
+
+        <div style={{ padding: "12px 24px 16px", borderTop: `1px solid ${C.border}`, display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
+          {err && <span style={{ fontSize: 11.5, color: "#E08A8A" }}>{err}</span>}
+          <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+            <ActionButton onClick={onClose}>Cancel</ActionButton>
+            <button onClick={save} className="gold-btn" style={{ background: C.gold, border: "none", borderRadius: 8, color: C.onGold, fontSize: 12.5, padding: "8px 18px", cursor: "pointer", fontWeight: 500 }}>{form ? "Save" : "Create form"}</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// One question row inside the FormEditor.
+function QuestionEditor({ q, idx, total, grouping, threadOptions, onChange, onMove, onRemove, inputStyle, selectStyle }) {
+  const cfg = QTYPES[q.type];
+  const perQuestion  = grouping === "per-question";
+  const parentReplies = grouping === "parent-replies";
+  const isBody = q.placement === "body";
+  const addOption    = () => onChange({ options: [...(q.options || []), ""] });
+  const setOption    = (i, v) => onChange({ options: (q.options || []).map((o, oi) => oi === i ? v : o) });
+  const removeOption = (i) => onChange({ options: (q.options || []).filter((_, oi) => oi !== i) });
+  const iconBtn = (extra) => ({ background: "transparent", border: "none", padding: 4, display: "flex", ...extra });
+  return (
+    <div style={{ border: `1px solid ${C.border}`, borderRadius: 11, padding: "12px 14px", background: C.surf2 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: cfg.hasOptions || cfg.isScale ? 10 : 10 }}>
+        <span style={{ fontSize: 11, color: C.text3, fontWeight: 600, width: 18, flexShrink: 0 }}>{idx + 1}.</span>
+        <input value={q.label} onChange={e => onChange({ label: e.target.value })} placeholder="Question..." style={{ ...inputStyle, flex: 1, padding: "8px 11px" }} />
+        <select value={q.type} onChange={e => onChange({ type: e.target.value })} className="move-select" style={selectStyle}>
+          {Object.entries(QTYPES).map(([k, m]) => <option key={k} value={k}>{m.label}</option>)}
+        </select>
+        <button onClick={() => onMove(-1)} disabled={idx === 0} className="ghost" style={iconBtn({ cursor: idx === 0 ? "default" : "pointer", color: idx === 0 ? C.text3 : C.text2, opacity: idx === 0 ? 0.4 : 1 })}><ArrowUp size={13} /></button>
+        <button onClick={() => onMove(1)} disabled={idx === total - 1} className="ghost" style={iconBtn({ cursor: idx === total - 1 ? "default" : "pointer", color: idx === total - 1 ? C.text3 : C.text2, opacity: idx === total - 1 ? 0.4 : 1 })}><ArrowDown size={13} /></button>
+        <button onClick={onRemove} className="ghost" style={iconBtn({ cursor: "pointer", color: "#D67878" })}><X size={14} /></button>
+      </div>
+
+      {cfg.hasOptions && (
+        <div style={{ paddingLeft: 26, marginBottom: 10, display: "flex", flexDirection: "column", gap: 6 }}>
+          {(q.options || []).map((opt, oi) => (
+            <div key={oi} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <span style={{ color: C.text3, fontSize: 12 }}>•</span>
+              <input value={opt} onChange={e => setOption(oi, e.target.value)} placeholder={`Option ${oi + 1}`} style={{ ...inputStyle, flex: 1, padding: "6px 10px", fontSize: 12.5 }} />
+              <button onClick={() => removeOption(oi)} className="ghost" style={iconBtn({ cursor: "pointer", color: C.text3 })}><X size={12} /></button>
+            </div>
+          ))}
+          <button onClick={addOption} className="ghost" style={{ alignSelf: "flex-start", background: "transparent", border: "none", color: C.gold, fontSize: 12, cursor: "pointer", padding: "2px 4px" }}>+ Add option</button>
+        </div>
+      )}
+
+      {cfg.isScale && (
+        <div style={{ paddingLeft: 26, marginBottom: 10, display: "flex", alignItems: "center", gap: 12 }}>
+          <label style={{ fontSize: 12, color: C.text3, display: "flex", alignItems: "center", gap: 6 }}>Min <input type="number" value={q.min ?? 1} onChange={e => onChange({ min: Number(e.target.value) })} style={{ ...selectStyle, color: C.text, width: 56 }} /></label>
+          <label style={{ fontSize: 12, color: C.text3, display: "flex", alignItems: "center", gap: 6 }}>Max <input type="number" value={q.max ?? 5} onChange={e => onChange({ max: Number(e.target.value) })} style={{ ...selectStyle, color: C.text, width: 56 }} /></label>
+        </div>
+      )}
+
+      <div style={{ paddingLeft: 26, display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
+        <label style={{ fontSize: 12, color: C.text2, display: "flex", alignItems: "center", gap: 7, cursor: "pointer" }}>
+          <input type="checkbox" checked={!!q.required} onChange={e => onChange({ required: e.target.checked })} style={{ accentColor: C.gold }} /> Required
+        </label>
+        {perQuestion && (
+          <>
+            <label style={{ fontSize: 12, color: C.text3, display: "flex", alignItems: "center", gap: 6 }}>
+              Route to
+              <select value={q.threadId || ""} onChange={e => onChange({ threadId: e.target.value || null })} className="move-select" style={selectStyle}>
+                <option value="">(form default)</option>
+                {threadOptions.map(t => <option key={t.id} value={t.id}>{t.id === "inbox" ? "Inbox" : t.title}</option>)}
+              </select>
+            </label>
+            <SegSelect value={q.subtype || "entry"} onChange={v => onChange({ subtype: v })} options={[{ value: "entry", label: "Entry" }, { value: "note", label: "Note" }]} />
+          </>
+        )}
+        {parentReplies && (
+          <>
+            <SegSelect value={isBody ? "body" : "reply"} onChange={v => onChange({ placement: v })} options={[{ value: "body", label: "Body" }, { value: "reply", label: "Reply" }]} />
+            {!isBody && (
+              <label style={{ fontSize: 12, color: C.text3, display: "flex", alignItems: "center", gap: 6 }} title="Questions sharing a group label combine into one reply">
+                Group
+                <input value={q.replyGroup || ""} onChange={e => onChange({ replyGroup: e.target.value })} placeholder="(own reply)" style={{ ...selectStyle, color: C.text, width: 110 }} />
+              </label>
+            )}
+          </>
+        )}
       </div>
     </div>
   );
@@ -1592,8 +2215,15 @@ function SmartSurface({ threads, allThreads, go }) {
                   <Calendar size={15} color={accent} />
                 </div>
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 11, color: accent, fontWeight: 500, marginBottom: 3 }}>
-                    {overdue ? "Overdue" : item.diff === 0 ? "Due today" : formatDue(item.entry.dueDate)} · {item.thread.title}
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3 }}>
+                    {overdue && (
+                      <span style={{ fontSize: 9.5, fontWeight: 600, color: "#D67878", background: "rgba(214,120,120,0.16)", padding: "2px 7px", borderRadius: 10, display: "flex", alignItems: "center", gap: 4, flexShrink: 0 }}>
+                        <AlertCircle size={9} color="#D67878" /> Overdue
+                      </span>
+                    )}
+                    <span style={{ fontSize: 11, color: accent, fontWeight: 500 }}>
+                      {overdue ? item.thread.title : `${item.diff === 0 ? "Due today" : formatDue(item.entry.dueDate)} · ${item.thread.title}`}
+                    </span>
                   </div>
                   <div style={{ fontSize: 12.5, color: C.text2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{item.entry.text}</div>
                 </div>
@@ -1621,6 +2251,21 @@ function SmartSurface({ threads, allThreads, go }) {
   );
 }
 
+// Count overdue board tasks in a thread and all of its descendant threads, so a
+// root card surfaces work buried in sub-threads too.
+function overdueInSubtree(threads, thread) {
+  let n = 0;
+  if (thread.type === "board") {
+    n += thread.entries.filter(e => {
+      if (e.checked || e.subtype === "note" || !e.dueDate) return false;
+      const diff = dueDayDiff(e.dueDate);
+      return diff !== null && diff < 0;
+    }).length;
+  }
+  for (const c of getChildren(threads, thread.id)) n += overdueInSubtree(threads, c);
+  return n;
+}
+
 function ThreadCard({ thread, threads, go, i }) {
   const cfg      = TYPES[thread.type];
   const Icon     = cfg.icon;
@@ -1629,6 +2274,7 @@ function ThreadCard({ thread, threads, go, i }) {
   const done     = isBoardT ? thread.entries.filter(e => e.checked).length : null;
   const total    = isBoardT ? thread.entries.filter(e => e.subtype !== "note").length : thread.entries.length;
   const children = getChildren(threads, thread.id);
+  const overdue  = overdueInSubtree(threads, thread);
   return (
     <div className="t-card" onClick={() => go(thread.id)} style={{ background: C.surf, border: `1px solid ${C.border}`, borderRadius: 16, padding: "22px 24px", cursor: "pointer", animation: `fadeUp 0.24s ${Math.min(i, 5) * 0.02}s ease both` }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
@@ -1636,7 +2282,14 @@ function ThreadCard({ thread, threads, go, i }) {
           <Icon size={10} color={cfg.color} />
           <span style={{ fontSize: 10, color: cfg.color, fontWeight: 500, letterSpacing: "0.05em", textTransform: "uppercase" }}>{cfg.label}</span>
         </div>
-        <span style={{ fontSize: 10.5, color: C.text3 }}>{done !== null ? `${done}/${total} done` : `${total} entries`}</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {overdue > 0 && (
+            <span style={{ fontSize: 10, fontWeight: 600, color: "#D67878", background: "rgba(214,120,120,0.16)", padding: "2px 8px", borderRadius: 10, display: "flex", alignItems: "center", gap: 4 }}>
+              <AlertCircle size={10} color="#D67878" /> {overdue} overdue
+            </span>
+          )}
+          <span style={{ fontSize: 10.5, color: C.text3 }}>{done !== null ? `${done}/${total} done` : `${total} entries`}</span>
+        </div>
       </div>
       <div style={{ fontFamily: "'Cormorant', serif", fontSize: 17.5, lineHeight: 1.38, marginBottom: children.length > 0 ? 12 : 16 }}>{thread.title}</div>
       {children.length > 0 && (
@@ -1798,6 +2451,7 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, addEntries, upd
   const [showDone, setShowDone]         = useState(showDoneDefault);
   const [dragId, setDragId]             = useState(null);
   const [dropId, setDropId]             = useState(null);
+  const [dropPos, setDropPos]           = useState("before"); // "before" | "after" the dropId row
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft]     = useState(thread.title);
   const [editingDesc, setEditingDesc]   = useState(false);
@@ -1875,15 +2529,26 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, addEntries, upd
     setShowBulk(false);
   };
 
-  const handleDrop = (targetId) => {
-    if (!dragId || !targetId || dragId === targetId) { setDragId(null); setDropId(null); return; }
+  // Reorder is only allowed within a sibling group: two top-level entries, or two
+  // replies of the same parent. Prevents a drag from silently re-parenting an entry.
+  const sameSiblings = (aId, bId) => {
+    const a = thread.entries.find(e => e.id === aId);
+    const b = thread.entries.find(e => e.id === bId);
+    return a && b && (a.parentEntryId || null) === (b.parentEntryId || null);
+  };
+  const canDropOn = (targetId) => !!dragId && dragId !== targetId && sameSiblings(dragId, targetId);
+  const endDrag = () => { setDragId(null); setDropId(null); };
+
+  const handleDrop = (targetId, pos) => {
+    if (!canDropOn(targetId)) { endDrag(); return; }
     const entries = [...thread.entries];
-    const from = entries.findIndex(e => e.id === dragId);
-    const to   = entries.findIndex(e => e.id === targetId);
-    const [moved] = entries.splice(from, 1);
+    const [moved] = entries.splice(entries.findIndex(e => e.id === dragId), 1);
+    // Recompute the target index AFTER removal, then land just before/after it.
+    let to = entries.findIndex(e => e.id === targetId);
+    if (pos === "after") to += 1;
     entries.splice(to, 0, moved);
     reorderEntries(thread.id, entries);
-    setDragId(null); setDropId(null);
+    endDrag();
   };
 
   const placeholder = isInbox ? "Add to inbox..." : {
@@ -2068,11 +2733,20 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, addEntries, upd
           {activeEntries.map((e, i) => (
             <EntryTreeNode
               key={e.id} entry={e} i={i} depth={0}
-              draggable={isBoard && !sortOrder} dragId={dragId} dropId={dropId}
-              onDragStart={() => setDragId(e.id)}
-              onDragOver={(ev) => { ev.preventDefault(); setDropId(e.id); }}
-              onDrop={() => handleDrop(e.id)}
-              onDragEnd={() => { setDragId(null); setDropId(null); }}
+              canDrag={!sortOrder} dragId={dragId} dropId={dropId} dropPos={dropPos}
+              onDragStartId={(id) => setDragId(id)}
+              onDragOverId={(id, ev) => {
+                ev.preventDefault();
+                if (!canDropOn(id)) { setDropId(null); return; }
+                const r = ev.currentTarget.getBoundingClientRect();
+                setDropId(id);
+                setDropPos(ev.clientY < r.top + r.height / 2 ? "before" : "after");
+              }}
+              onDropId={(id, ev) => {
+                const r = ev.currentTarget.getBoundingClientRect();
+                handleDrop(id, ev.clientY < r.top + r.height / 2 ? "before" : "after");
+              }}
+              onDragEnd={endDrag}
               {...sharedEntryProps}
             />
           ))}
@@ -2087,7 +2761,7 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, addEntries, upd
             {showDone && (
               <div style={{ opacity: 0.6, ...listContainerStyle }}>
                 {doneEntries.map((e, i) => (
-                  <EntryTreeNode key={e.id} entry={e} i={i} depth={0} draggable={false} dragId={null} dropId={null} onDragStart={() => {}} onDragOver={() => {}} onDrop={() => {}} onDragEnd={() => {}} {...sharedEntryProps} />
+                  <EntryTreeNode key={e.id} entry={e} i={i} depth={0} canDrag={false} dragId={null} dropId={null} onDragStartId={() => {}} onDragOverId={() => {}} onDropId={() => {}} onDragEnd={() => {}} {...sharedEntryProps} />
                 ))}
               </div>
             )}
@@ -2232,16 +2906,22 @@ function SubThreadSection({ children, parentThread, go, setShowNew }) {
 }
 
 // ─── ENTRY TREE NODE (recursive) ───
-function EntryTreeNode({ entry, depth, i, childrenOf, layout = "list", draggable: isDraggable, dragId, dropId, onDragStart, onDragOver, onDrop, onDragEnd, ...rowProps }) {
+function EntryTreeNode({ entry, depth, i, childrenOf, layout = "list", canDrag, dragId, dropId, dropPos, onDragStartId, onDragOverId, onDropId, onDragEnd, ...rowProps }) {
   const replies = childrenOf[entry.id] || [];
   const lineColor = rowProps.cfg.color;
   const [collapsed, setCollapsed] = useState(false);
+  const dragProps = {
+    canDrag, dragId, dropId, dropPos, onDragStartId, onDragOverId, onDropId, onDragEnd,
+  };
   return (
     <div>
       <EntryRow
         entry={entry} depth={depth} i={i} layout={layout}
-        draggable={isDraggable && depth === 0} dragId={dragId} dropId={dropId}
-        onDragStart={onDragStart} onDragOver={onDragOver} onDrop={onDrop} onDragEnd={onDragEnd}
+        draggable={canDrag} dragId={dragId} dropId={dropId} dropPos={dropPos}
+        onDragStart={() => onDragStartId(entry.id)}
+        onDragOver={(ev) => onDragOverId(entry.id, ev)}
+        onDrop={(ev) => onDropId(entry.id, ev)}
+        onDragEnd={onDragEnd}
         {...rowProps}
       />
       {replies.length > 0 && (
@@ -2261,8 +2941,7 @@ function EntryTreeNode({ entry, depth, i, childrenOf, layout = "list", draggable
                 <EntryTreeNode
                   key={r.id} entry={r} depth={depth + 1} i={ri}
                   childrenOf={childrenOf} layout={layout}
-                  draggable={false} dragId={null} dropId={null}
-                  onDragStart={() => {}} onDragOver={() => {}} onDrop={() => {}} onDragEnd={() => {}}
+                  {...dragProps}
                   {...rowProps}
                 />
               ))}
@@ -2275,7 +2954,7 @@ function EntryTreeNode({ entry, depth, i, childrenOf, layout = "list", draggable
 }
 
 // ─── ENTRY ROW ───
-function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, setDueDate, setEntryDate, deleteEntry, updateEntry, editingId, setEditingId, onReply, isBoard, isInbox, otherThreads, moveEntry, layout = "list", draggable: isDraggable, dragId, dropId, onDragStart, onDragOver, onDrop, onDragEnd, i, selectedEntryIds, toggleEntrySelection }) {
+function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, setDueDate, setEntryDate, deleteEntry, updateEntry, editingId, setEditingId, onReply, isBoard, isInbox, otherThreads, moveEntry, layout = "list", draggable: isDraggable, dragId, dropId, dropPos, onDragStart, onDragOver, onDrop, onDragEnd, i, selectedEntryIds, toggleEntrySelection }) {
   const [editText, setEditText] = useState(entry.text);
   const [moveOpen, setMoveOpen] = useState(false);
   const editRef  = useRef(null);
@@ -2292,7 +2971,8 @@ function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, setDueDat
     return () => { document.removeEventListener("mousedown", onDocClick); document.removeEventListener("keydown", onKey); };
   }, [moveOpen]);
   const isEditing  = editingId === entry.id;
-  const isDragOver = dropId === entry.id && dragId !== entry.id;
+  const isDropTarget = dropId === entry.id && dragId !== entry.id;   // show insertion line
+  const isDragging   = dragId === entry.id;                          // this row is being dragged
   const isNote     = entry.subtype === "note";
   // Notes are plain text regardless of thread type — no checkbox/pin/due, even in a board.
   const isBoardEntry = isBoard && !isNote;
@@ -2360,7 +3040,7 @@ function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, setDueDat
   };
 
   return (
-    <div className={`e-row ${isDragOver ? "drag-over" : ""} ${isSelected ? "selected" : ""}`}
+    <div className={`e-row ${isSelected ? "selected" : ""}`}
       draggable={isDraggable && !isEditing}
       onDragStart={onDragStart} onDragOver={onDragOver} onDrop={onDrop} onDragEnd={onDragEnd}
       onMouseDown={handleRowMouseDown}
@@ -2371,9 +3051,15 @@ function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, setDueDat
         borderBottom: `1px solid ${C.divider}`,
         alignItems: "flex-start", position: "relative",
         animation: `fadeUp 0.18s ${Math.min(i, 6) * 0.012}s ease both`,
+        opacity: isDragging ? 0.4 : 1,
         ...(isSelected ? { background: "rgba(200,165,100,0.10)", outline: `1px solid ${C.goldBorder}`, borderRadius: 8 } : null),
       }}
     >
+      {isDropTarget && (
+        <div style={{ position: "absolute", left: 0, right: 0, [dropPos === "after" ? "bottom" : "top"]: -1, height: 2, background: C.gold, borderRadius: 2, pointerEvents: "none", zIndex: 3 }}>
+          <div style={{ position: "absolute", left: -2, top: -2, width: 6, height: 6, borderRadius: "50%", background: C.gold }} />
+        </div>
+      )}
       {isDraggable && !isEditing && (
         <div style={{ color: C.text3, opacity: 0.3, cursor: "grab", flexShrink: 0, marginTop: 3 }}>
           <GripVertical size={13} />

@@ -35,7 +35,8 @@ function readSavedTheme() {
 // Kept out of loom-data.json because the renderer rewrites that blob wholesale
 // and would erase any keys it doesn't know about.
 const DEFAULT_WIDGET_CONFIG = {
-  visible: true,
+  visible: false,           // runtime "is it shown right now"; re-derived from openOnLaunch at startup
+  openOnLaunch: false,      // persistent "auto-show the widget when Loom starts"
   layering: "float",        // "float" (always-on-top) | "recede" (coverable)
   launchAtLogin: false,
   hotkey: "Alt+Space",
@@ -424,6 +425,14 @@ app.whenReady().then(() => {
 
   // If launched at login (hidden), skip the big window -- just bring up the widget.
   const openedAtLogin = !isDev && app.getLoginItemSettings().wasOpenedAtLogin;
+
+  // Session visibility starts from the persistent launch preference, so a stale
+  // `visible:true` left over from a prior session (e.g. dismissed with Escape,
+  // which doesn't persist) can't force the widget open on every launch. Opening
+  // at login is the one case where the widget IS the point, so always show then.
+  widgetConfig.visible = openedAtLogin || !!widgetConfig.openOnLaunch;
+  writeWidgetConfig(widgetConfig);
+
   if (!openedAtLogin) createWindow();
   createWidgetWindow();
 
