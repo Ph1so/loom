@@ -14,6 +14,15 @@ contextBridge.exposeInMainWorld("loomAPI", {
   setWidgetConfig: (patch) => ipcRenderer.invoke("set-widget-config", patch),
   hideWidget: () => ipcRenderer.invoke("hide-widget"),
 
+  // Smart sort (LLM). The API key stays in the main process; the renderer only
+  // learns whether one is set via `hasKey`.
+  getLlmConfig: () => ipcRenderer.invoke("get-llm-config"),
+  setLlmConfig: (patch) => ipcRenderer.invoke("set-llm-config", patch),
+  getMemoryStatus: () => ipcRenderer.invoke("get-memory-status"),
+  suggestSort: (payload) => ipcRenderer.invoke("llm-suggest-sort", payload),
+  reviewJournal: (payload) => ipcRenderer.invoke("llm-review-journal", payload),
+  buildMemory: (payload) => ipcRenderer.invoke("llm-build-memory", payload),
+
   // Notifies the renderer when the data file changed underneath it (e.g. a
   // widget capture). Returns an unsubscribe function.
   onDataChanged: (cb) => {

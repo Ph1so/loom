@@ -1,10 +1,55 @@
 const { app, BrowserWindow, ipcMain, shell, Menu, dialog, globalShortcut } = require("electron");
 const path = require("path");
 const fs = require("fs");
+const llm = require("./llm");
 
 const isDev = !app.isPackaged;
 const dataPath = path.join(app.getPath("userData"), "loom-data.json");
 const widgetConfigPath = path.join(app.getPath("userData"), "widget-config.json");
+// LLM config (API key + model + toggle) and the generated thread-memory profiles
+// live in their own main-process-owned files, kept out of loom-data.json for the
+// same reason as the widget config: the renderer rewrites that blob wholesale and
+// would erase keys it doesn't know about. The API key must never round-trip to the
+// renderer, so a separate store is also the safer place for it.
+const llmConfigPath = path.join(app.getPath("userData"), "llm-config.json");
+const llmMemoryPath = path.join(app.getPath("userData"), "llm-memory.json");
+
+// Optional developer default: an Anthropic key read from a gitignored .env, used
+// only when the user hasn't entered one in Settings. Parsed once at startup. The
+// .env is not bundled into the packaged app, so in production this resolves to
+// nothing and the Settings key is the only source — this is a dev convenience.
+function loadEnvFile() {
+  const candidates = [
+    path.join(__dirname, "..", ".env"),        // loom-desktop/.env (the dev cwd)
+    path.join(__dirname, "..", "..", ".env"),  // repo-root .env
+  ];
+  for (const p of candidates) {
+    try {
+      if (!fs.existsSync(p)) continue;
+      const out = {};
+      for (const line of fs.readFileSync(p, "utf8").split(/\r?\n/)) {
+        const s = line.trim();
+        if (!s || s.startsWith("#")) continue;
+        const eq = s.indexOf("=");
+        if (eq === -1) continue;
+        const k = s.slice(0, eq).trim();
+        let v = s.slice(eq + 1).trim();
+        if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+        if (k && !(k in out)) out[k] = v;
+      }
+      return out;
+    } catch (e) {
+      console.error("Failed to read .env:", e);
+    }
+  }
+  return {};
+}
+const envFile = loadEnvFile();
+
+// The default key: an explicit process env var wins over the .env file.
+function defaultApiKey() {
+  return (process.env.ANTHROPIC_API_KEY || envFile.ANTHROPIC_API_KEY || "").trim();
+}
 
 const THEME_BG = { dark: "#0B0A08", light: "#FDFAF3" };
 
@@ -63,6 +108,104 @@ function writeWidgetConfig(cfg) {
   } catch (e) {
     console.error("Failed to write widget config:", e);
     return false;
+  }
+}
+
+// ── LLM config + thread memory (separate main-process-owned files) ──
+const DEFAULT_LLM_CONFIG = {
+  apiKey: "",                    // Anthropic API key — never sent back to the renderer
+  model: llm.DEFAULT_MODEL,      // which Claude model powers suggestions
+  enabled: false,                // master switch for the smart-sort features
+};
+
+function readLlmConfig() {
+  try {
+    if (fs.existsSync(llmConfigPath)) {
+      const parsed = JSON.parse(fs.readFileSync(llmConfigPath, "utf8"));
+      return { ...DEFAULT_LLM_CONFIG, ...parsed };
+    }
+  } catch (e) {
+    console.error("Failed to read LLM config:", e);
+  }
+  return { ...DEFAULT_LLM_CONFIG };
+}
+
+function writeLlmConfig(cfg) {
+  try {
+    fs.writeFileSync(llmConfigPath, JSON.stringify(cfg, null, 2), "utf8");
+    return true;
+  } catch (e) {
+    console.error("Failed to write LLM config:", e);
+    return false;
+  }
+}
+
+// The renderer only ever sees whether a key is set, never the key itself. It also
+// learns whether the active key is the user's own or the .env default, so Settings
+// can label the state.
+function publicLlmConfig(cfg) {
+  const userKey = !!(cfg.apiKey && cfg.apiKey.trim());
+  const defaultKey = !!defaultApiKey();
+  return {
+    hasKey: userKey || defaultKey,
+    hasUserKey: userKey,
+    usingDefaultKey: !userKey && defaultKey,
+    model: cfg.model,
+    enabled: !!cfg.enabled,
+  };
+}
+
+function readLlmMemory() {
+  try {
+    if (fs.existsSync(llmMemoryPath)) {
+      const parsed = JSON.parse(fs.readFileSync(llmMemoryPath, "utf8"));
+      if (parsed && Array.isArray(parsed.profiles)) return parsed;
+    }
+  } catch (e) {
+    console.error("Failed to read LLM memory:", e);
+  }
+  return null;
+}
+
+// Lazily construct the SDK client from the stored key. Returns null when unusable
+// so callers can surface a clean "not configured" error instead of throwing.
+// `enabled` is the renderer-side UI gate; at the API boundary we only need a key
+// (so e.g. "Build memory" in Settings works before the master switch is flipped).
+function getAnthropicClient() {
+  const cfg = readLlmConfig();
+  const key = (cfg.apiKey || "").trim() || defaultApiKey();
+  if (!key) return { error: "no_key" };
+  try {
+    const Anthropic = require("@anthropic-ai/sdk");
+    const client = new Anthropic({ apiKey: key });
+    return { client, model: cfg.model || llm.DEFAULT_MODEL };
+  } catch (e) {
+    console.error("Failed to init Anthropic SDK:", e);
+    return { error: "sdk_init_failed" };
+  }
+}
+
+// Run one structured (JSON-schema-constrained) request and return the parsed
+// object. Any failure resolves to { error } — network faults never reach the UI
+// as an unhandled rejection.
+async function runStructured(client, model, built) {
+  try {
+    const resp = await client.messages.create({
+      model,
+      max_tokens: 1024,
+      system: built.system,
+      messages: built.messages,
+      output_config: { format: { type: "json_schema", schema: built.schema } },
+    });
+    const text = (resp.content || [])
+      .filter((b) => b && b.type === "text")
+      .map((b) => b.text)
+      .join("");
+    return { object: llm.coerceObject(text) };
+  } catch (e) {
+    const status = e && e.status;
+    console.error("LLM request failed:", status || "", e && e.message);
+    return { error: status === 401 ? "bad_key" : status === 429 ? "rate_limited" : "request_failed" };
   }
 }
 
@@ -205,6 +348,71 @@ ipcMain.handle("set-widget-config", (event, patch) => {
 ipcMain.handle("hide-widget", () => {
   if (widgetWindow && !widgetWindow.isDestroyed()) widgetWindow.hide();
   return true;
+});
+
+// ── IPC: smart sort (LLM) ───────────────────────────────────
+ipcMain.handle("get-llm-config", () => publicLlmConfig(readLlmConfig()));
+
+ipcMain.handle("set-llm-config", (event, patch) => {
+  const cfg = readLlmConfig();
+  if (patch && typeof patch === "object") {
+    if (typeof patch.apiKey === "string") cfg.apiKey = patch.apiKey.trim();
+    if (typeof patch.model === "string") cfg.model = patch.model;
+    if (typeof patch.enabled === "boolean") cfg.enabled = patch.enabled;
+    writeLlmConfig(cfg);
+  }
+  return publicLlmConfig(cfg);
+});
+
+ipcMain.handle("get-memory-status", () => {
+  const mem = readLlmMemory();
+  return mem ? { generatedAt: mem.generatedAt || null, count: mem.profiles.length } : { generatedAt: null, count: 0 };
+});
+
+// Suggest the single best thread for one Inbox entry.
+ipcMain.handle("llm-suggest-sort", async (event, payload) => {
+  const conn = getAnthropicClient();
+  if (conn.error) return { ok: false, error: conn.error };
+  const threads = Array.isArray(payload?.threads) ? payload.threads : [];
+  const entryText = typeof payload?.entryText === "string" ? payload.entryText : "";
+  if (!entryText.trim()) return { ok: false, error: "empty" };
+  const built = llm.buildSuggest({ entryText, threads, memory: readLlmMemory() });
+  const res = await runStructured(conn.client, conn.model, built);
+  if (res.error) return { ok: false, error: res.error };
+  return { ok: true, suggestion: llm.parseSuggestion(res.object, threads) };
+});
+
+// Audit entries across threads and return confident relocation suggestions.
+ipcMain.handle("llm-review-journal", async (event, payload) => {
+  const conn = getAnthropicClient();
+  if (conn.error) return { ok: false, error: conn.error };
+  const threads = Array.isArray(payload?.threads) ? payload.threads : [];
+  if (llm.reviewEntries(threads).length === 0) return { ok: true, suggestions: [] };
+  // Review intentionally ignores memory profiles (see electron/llm.js buildReview).
+  const built = llm.buildReview({ threads });
+  const res = await runStructured(conn.client, conn.model, built);
+  if (res.error) return { ok: false, error: res.error };
+  return { ok: true, suggestions: llm.parseReview(res.object, threads) };
+});
+
+// (Re)build the compact per-thread memory profiles used to enrich suggestions.
+ipcMain.handle("llm-build-memory", async (event, payload) => {
+  const conn = getAnthropicClient();
+  if (conn.error) return { ok: false, error: conn.error };
+  const threads = Array.isArray(payload?.threads) ? payload.threads : [];
+  if (llm.fileableThreads(threads).length === 0) return { ok: false, error: "no_threads" };
+  const built = llm.buildMemory({ threads });
+  const res = await runStructured(conn.client, conn.model, built);
+  if (res.error) return { ok: false, error: res.error };
+  const parsed = llm.parseMemory(res.object, threads);
+  const generatedAt = nowISO();
+  try {
+    fs.writeFileSync(llmMemoryPath, JSON.stringify({ generatedAt, profiles: parsed.profiles }, null, 2), "utf8");
+  } catch (e) {
+    console.error("Failed to write LLM memory:", e);
+    return { ok: false, error: "write_failed" };
+  }
+  return { ok: true, generatedAt, count: parsed.profiles.length };
 });
 
 // ── Helpers ─────────────────────────────────────────────────

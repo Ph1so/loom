@@ -13,6 +13,8 @@ export const PALETTES = {
     track: "rgba(255,255,255,0.06)", dashed: "rgba(255,255,255,0.09)",
     divider: "rgba(255,255,255,0.05)", modalSurf: "#161410",
     onGold: "#0B0A08", scrim: "rgba(6,5,4,0.65)",
+    danger: "#D67878", dangerBg: "rgba(214,120,120,0.12)",
+    dangerBorder: "rgba(214,120,120,0.32)", onDanger: "#1A0E0D",
   },
   light: {
     bg: "#FDFAF3", sb: "#F5EFE2", surf: "#FFFFFF", surf2: "#FAF6EC",
@@ -25,5 +27,7 @@ export const PALETTES = {
     track: "rgba(0,0,0,0.09)", dashed: "rgba(0,0,0,0.14)",
     divider: "rgba(0,0,0,0.06)", modalSurf: "#FFFFFF",
     onGold: "#FFFFFF", scrim: "rgba(40,32,24,0.32)",
+    danger: "#B4483F", dangerBg: "rgba(180,72,63,0.08)",
+    dangerBorder: "rgba(180,72,63,0.28)", onDanger: "#FFFFFF",
   },
 };

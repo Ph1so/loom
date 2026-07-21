@@ -3,3 +3,8 @@ dist/
 release/
 .DS_Store
 *.local
+
+# Env / secrets (the default Anthropic key lives here; never commit it)
+.env
+.env.*
+!.env.example

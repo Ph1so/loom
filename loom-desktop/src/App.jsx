@@ -4,7 +4,7 @@ import {
   LayoutGrid, Feather, Zap, Clock, Pin, CornerDownRight, ChevronDown,
   ChevronRight, Inbox, GripVertical, AlignLeft, List,
   AlertCircle, BookOpen, FolderOpen, Folder, Trash2, Settings, Sun, Moon,
-  Calendar, FolderInput, ArrowUp, ArrowDown, ClipboardList, FileText
+  Calendar, FolderInput, ArrowUp, ArrowDown, ClipboardList, FileText, Sparkles
 } from "lucide-react";
 import { buildExportMarkdown } from "./export.js";
 import { PALETTES } from "./palette.js";
@@ -19,6 +19,8 @@ const G = `
   @keyframes fadeUp { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
   @keyframes fadeIn { from { opacity:0; } to { opacity:1; } }
   @keyframes slideIn { from { opacity:0; transform:translateY(16px) scale(0.98); } to { opacity:1; transform:translateY(0) scale(1); } }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes popIn { from { opacity:0; transform:scale(0.6); } to { opacity:1; transform:scale(1); } }
   .t-card { transition: background 0.18s, border-color 0.18s, transform 0.18s; }
   .t-card:hover { background: #1C1A15 !important; border-color: rgba(255,255,255,0.11) !important; transform: translateY(-1px); }
   .s-item { transition: background 0.13s; border-radius: 8px; }
@@ -79,6 +81,21 @@ const G = `
 // the `Loom` render based on the active theme, so subsequent child renders see
 // the right palette. Safe because React renders happen synchronously top-down.
 let C = PALETTES.dark;
+
+// ─────────────────────────────────────────────────────────────
+// Themed confirm dialog (replaces the native window.confirm so the
+// prompt matches Loom's aesthetic and honors light/dark mode). A single
+// <ConfirmHost/> mounted in Loom listens for imperative loomConfirm()
+// calls and resolves a promise with the user's choice.
+// ─────────────────────────────────────────────────────────────
+let confirmSetter = null;
+function loomConfirm(opts) {
+  const cfg = typeof opts === "string" ? { message: opts } : opts;
+  return new Promise(resolve => {
+    if (!confirmSetter) { resolve(window.confirm(cfg.message)); return; }
+    confirmSetter({ ...cfg, resolve });
+  });
+}
 
 const TYPES = {
   question: { label: "Question", color: "#6A9DC0", bg: "rgba(106,157,192,0.1)",  border: "rgba(106,157,192,0.2)",  icon: MessageCircle, desc: "Open-ended reflections you sit with over time" },
@@ -342,6 +359,24 @@ function touchThread(t) {
   return { ...t, updatedAt: nowISO() };
 }
 
+// Given a set of entry ids, return that set plus every reply descendant (by
+// parentEntryId). Used when deleting entries so replies don't get orphaned —
+// orphans stay hidden in ThreadView but still surface in the flat Timeline.
+function collectWithDescendants(entries, rootIds) {
+  const childrenOf = {};
+  entries.forEach(e => {
+    if (e.parentEntryId) (childrenOf[e.parentEntryId] ||= []).push(e.id);
+  });
+  const doomed = new Set();
+  const visit = (id) => {
+    if (doomed.has(id)) return;
+    doomed.add(id);
+    (childrenOf[id] || []).forEach(visit);
+  };
+  rootIds.forEach(visit);
+  return doomed;
+}
+
 // Compact, human display for a stored timestamp. Tolerates the legacy "Today"
 // sentinel and any non-ISO leftovers so old data files keep rendering.
 function formatTimestamp(value) {
@@ -356,6 +391,19 @@ function formatTimestamp(value) {
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
+// Friendly text for the error codes the main process returns from LLM calls.
+function llmErrorText(code) {
+  switch (code) {
+    case "no_key":
+    case "disabled":     return "Turn on Smart Sort and add an API key in Settings.";
+    case "bad_key":      return "That API key was rejected — check it in Settings.";
+    case "rate_limited": return "Rate limited by Claude — try again in a moment.";
+    case "empty":        return "Nothing to sort.";
+    case "no_threads":   return "Create a thread first.";
+    default:             return "Couldn't reach Claude. Try again.";
+  }
+}
+
 // ─────────────────────────────────────────────────────────────
 // ROOT
 // ─────────────────────────────────────────────────────────────
@@ -364,6 +412,13 @@ const DEFAULT_PREFS = {
   startupView: "home",         // "home" | "timeline" | "inbox" | "last"
   showDoneByDefault: false,    // initial value of ThreadView's showDone
 };
+
+// Models offered for Smart Sort (must match the ids main.js/electron/llm.js accept).
+const MODEL_OPTS = [
+  { value: "claude-haiku-4-5", label: "Haiku" },
+  { value: "claude-sonnet-5",  label: "Sonnet" },
+  { value: "claude-opus-4-8",  label: "Opus" },
+];
 
 function loadInitialPrefs() {
   try {
@@ -403,6 +458,18 @@ export default function Loom() {
   const [forms, setForms]             = useState([]);
   const [editingForm, setEditingForm] = useState(null);  // null | "new" | formId
   const [fillingForm, setFillingForm] = useState(null);  // null | formId
+  const [llmConfig, setLlmConfig]     = useState(null);  // { hasKey, model, enabled } | null (never holds the key)
+  const [showReview, setShowReview]   = useState(false); // journal-wide smart-sort review modal
+  // Cached review results, kept at the root so closing the modal to poke around
+  // in Loom and reopening it doesn't recompute. null = never run this session.
+  const [reviewState, setReviewState] = useState(null);  // null | { status, items, errMsg, resolved }
+
+  // Smart Sort readiness: the master switch is on AND a key is saved. Re-read
+  // when Settings closes so toggling it there lights up the Inbox affordances.
+  const refreshLlmConfig = () => window.loomAPI?.getLlmConfig?.().then(setLlmConfig).catch(() => {});
+  useEffect(() => { refreshLlmConfig(); }, []);
+  useEffect(() => { if (!showSettings) refreshLlmConfig(); }, [showSettings]);
+  const smartSortReady = !!(llmConfig && llmConfig.enabled && llmConfig.hasKey);
 
   // Make the active palette visible to every child component (read at render time).
   C = PALETTES[theme] || PALETTES.dark;
@@ -685,7 +752,13 @@ export default function Loom() {
   };
 
   const deleteEntry = (tid, eid) => {
-    setThreads(p => p.map(t => t.id === tid ? touchThread({ ...t, entries: t.entries.filter(e => e.id !== eid) }) : t));
+    setThreads(p => p.map(t => {
+      if (t.id !== tid) return t;
+      // Cascade to reply descendants so no orphaned replies linger (they'd
+      // stay hidden in ThreadView but still surface in the flat Timeline).
+      const doomed = collectWithDescendants(t.entries, new Set([eid]));
+      return touchThread({ ...t, entries: t.entries.filter(e => !doomed.has(e.id)) });
+    }));
   };
 
   // Move a set of entries (plus their reply descendants) to another thread.
@@ -823,11 +896,16 @@ export default function Loom() {
       };
       return prev
         .filter(t => !tids.has(t.id))
-        .map(t => ({
-          ...t,
-          parentId: tids.has(t.parentId) ? liftedParent(t.parentId) : t.parentId,
-          entries: eids.size ? t.entries.filter(e => !eids.has(e.id)) : t.entries,
-        }));
+        .map(t => {
+          if (!eids.size) return { ...t, parentId: tids.has(t.parentId) ? liftedParent(t.parentId) : t.parentId };
+          // Cascade to reply descendants so no orphaned replies linger.
+          const doomed = collectWithDescendants(t.entries, eids);
+          return {
+            ...t,
+            parentId: tids.has(t.parentId) ? liftedParent(t.parentId) : t.parentId,
+            entries: t.entries.filter(e => !doomed.has(e.id)),
+          };
+        });
     });
     if (tids.has(view)) go("home");
     setSelectedThreadIds(new Set());
@@ -894,7 +972,7 @@ export default function Loom() {
           clearSelection={clearSelection}
         />
         <main style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
-          {view === "home"     && <HomeView     threads={threads} rootThreads={rootThreads} go={go} setShowNew={setShowNew} addEntry={addEntry} forms={forms} onFillForm={setFillingForm} onSkipForm={skipForm} />}
+          {view === "home"     && <HomeView     threads={threads} rootThreads={rootThreads} go={go} setShowNew={setShowNew} addEntry={addEntry} forms={forms} onFillForm={setFillingForm} onSkipForm={skipForm} smartSortReady={smartSortReady} onReview={() => setShowReview(true)} />}
           {view === "timeline" && <TimelineView threads={threads} go={go} />}
           {view === "forms"    && <FormsView    forms={forms} threads={threads} onNew={() => setEditingForm("new")} onEdit={setEditingForm} onFill={setFillingForm} onDelete={deleteForm} />}
           {current && view !== "home" && view !== "timeline" && view !== "forms" && (
@@ -902,6 +980,7 @@ export default function Loom() {
               key={current.id} thread={current} threads={threads} go={go}
               setShowNew={setShowNew}
               showDoneDefault={prefs.showDoneByDefault}
+              smartSortReady={smartSortReady}
               {...ops}
               {...selection}
             />
@@ -937,6 +1016,15 @@ export default function Loom() {
             onClose={() => setShowSettings(false)}
           />
         )}
+        {showReview && (
+          <ReviewModal
+            threads={threads}
+            onApply={(fromTid, entryId, toTid) => moveEntry(fromTid, entryId, toTid)}
+            onClose={() => setShowReview(false)}
+            state={reviewState}
+            setState={setReviewState}
+          />
+        )}
         {editingForm && (
           <FormEditor
             form={editingForm === "new" ? null : forms.find(f => f.id === editingForm)}
@@ -953,6 +1041,7 @@ export default function Loom() {
             onClose={() => setFillingForm(null)}
           />
         )}
+        <ConfirmHost />
       </div>
     </>
   );
@@ -962,15 +1051,19 @@ export default function Loom() {
 // SELECTION BAR (floating, appears when items are multi-selected)
 // ─────────────────────────────────────────────────────────────
 function SelectionBar({ threadCount, entryCount, threads = [], onMoveEntries, onDelete, onClear }) {
+  const [moveOpen, setMoveOpen] = useState(false);
   const parts = [];
   if (threadCount) parts.push(`${threadCount} thread${threadCount > 1 ? "s" : ""}`);
   if (entryCount)  parts.push(`${entryCount} entr${entryCount > 1 ? "ies" : "y"}`);
   const label = parts.join(" + ") + " selected";
   const confirm = () => {
-    const msg = `Delete ${label}? Sub-threads of any deleted thread move up one level.`;
-    if (window.confirm(msg)) onDelete();
+    loomConfirm({
+      title: "Delete selection?",
+      message: `Delete ${label}? Sub-threads of any deleted thread move up one level. This can't be undone.`,
+    }).then(ok => { if (ok) onDelete(); });
   };
   return (
+    <>
     <div
       style={{
         position: "fixed", left: "50%", bottom: 24, transform: "translateX(-50%)",
@@ -982,20 +1075,14 @@ function SelectionBar({ threadCount, entryCount, threads = [], onMoveEntries, on
     >
       <span style={{ fontSize: 12.5, color: C.text2 }}>{label}</span>
       {entryCount > 0 && (
-        <select
-          className="move-select"
-          value=""
-          onChange={e => { if (e.target.value) { onMoveEntries?.(e.target.value); e.target.value = ""; } }}
+        <button
+          className="ghost"
+          onClick={() => setMoveOpen(true)}
           title="Move selected entries to another thread"
-          style={{ background: C.surf, border: `1px solid ${C.border}`, borderRadius: 8, color: C.text2, fontSize: 12, padding: "6px 10px", cursor: "pointer" }}
+          style={{ display: "flex", alignItems: "center", gap: 6, background: C.surf, border: `1px solid ${C.border}`, borderRadius: 8, color: C.text2, fontSize: 12, padding: "6px 12px", cursor: "pointer" }}
         >
-          <option value="">Move to thread...</option>
-          {threads.map(t => (
-            <option key={t.id} value={t.id}>
-              {t.id === "inbox" ? "Inbox" : (t.title.length > 40 ? t.title.slice(0, 40) + "..." : t.title)}
-            </option>
-          ))}
-        </select>
+          <FolderInput size={12} /> Move to thread…
+        </button>
       )}
       <button
         onClick={confirm}
@@ -1021,6 +1108,16 @@ function SelectionBar({ threadCount, entryCount, threads = [], onMoveEntries, on
       </button>
       <span style={{ fontSize: 10.5, color: C.text3, marginLeft: 2 }}>Esc</span>
     </div>
+    {moveOpen && (
+      <MoveToThreadModal
+        threads={threads}
+        title="Move entries"
+        subtitle={`Choose a destination for the ${entryCount} selected entr${entryCount > 1 ? "ies" : "y"}.`}
+        onPick={(tid) => { onMoveEntries?.(tid); setMoveOpen(false); }}
+        onClose={() => setMoveOpen(false)}
+      />
+    )}
+    </>
   );
 }
 
@@ -1100,6 +1197,16 @@ function ToggleSwitch({ checked, onChange }) {
   );
 }
 
+function Spinner({ color = "currentColor", size = 13 }) {
+  return (
+    <span style={{
+      display: "inline-block", width: size, height: size, borderRadius: "50%",
+      border: `2px solid ${color}`, borderTopColor: "transparent",
+      animation: "spin 0.6s linear infinite", flexShrink: 0,
+    }} />
+  );
+}
+
 function ActionButton({ onClick, children }) {
   return (
     <button
@@ -1130,6 +1237,99 @@ function collectSubtreeIds(threads, rootId) {
   };
   walk(rootId);
   return out;
+}
+
+// A single row in the move-to-thread tree picker. Mirrors the thread tree
+// order shown everywhere else (array order via getChildren). The source thread
+// is shown but disabled so its subtree stays reachable as a destination.
+function MoveThreadNode({ thread, threads, depth, excludeId, onPick }) {
+  const cfg = TYPES[thread.type] || TYPES.capture;
+  const Icon = cfg.icon;
+  const children = getChildren(threads, thread.id);
+  const disabled = thread.id === excludeId;
+  const boardTasks = thread.entries.filter(e => e.subtype !== "note");
+  const meta = thread.type === "board"
+    ? `${boardTasks.filter(e => e.checked).length}/${boardTasks.length}`
+    : `${thread.entries.length}`;
+  const title = thread.id === "inbox" ? "Inbox" : thread.title;
+
+  return (
+    <>
+      <button
+        className="ghost"
+        disabled={disabled}
+        onClick={() => { if (!disabled) onPick(thread.id); }}
+        title={disabled ? "Entries are already in this thread" : `Move to ${title}`}
+        style={{
+          display: "flex", alignItems: "center", gap: 9, width: "100%",
+          textAlign: "left", padding: "7px 10px", paddingLeft: 10 + depth * 16,
+          background: "transparent", border: "none", borderRadius: 7,
+          cursor: disabled ? "default" : "pointer",
+          opacity: disabled ? 0.4 : 1,
+        }}
+      >
+        <Icon size={11} color={cfg.color} style={{ flexShrink: 0 }} />
+        <span style={{ fontSize: 12.5, color: C.text, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {title}
+        </span>
+        <span style={{ fontSize: 10.5, color: C.text3, flexShrink: 0 }}>{meta}</span>
+      </button>
+      {children.map(child => (
+        <MoveThreadNode
+          key={child.id} thread={child} threads={threads} depth={depth + 1}
+          excludeId={excludeId} onPick={onPick}
+        />
+      ))}
+    </>
+  );
+}
+
+// Tree-organized destination picker for moving entries between threads. Same
+// hierarchy/ordering as the Sidebar and the LLM export picker.
+function MoveToThreadModal({ threads, excludeId = null, title = "Move to thread", subtitle, onPick, onClose }) {
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); onClose(); } };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const inbox = threads.find(t => t.id === "inbox");
+  const roots = threads.filter(t => t.parentId == null && t.id !== "inbox");
+  const ordered = inbox ? [inbox, ...roots] : roots;
+
+  return (
+    <div
+      onClick={e => { e.stopPropagation(); onClose(); }}
+      style={{ position: "fixed", inset: 0, background: C.scrim, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 320, animation: "fadeIn 0.18s ease both", backdropFilter: "blur(6px)" }}
+    >
+      <div
+        onClick={e => e.stopPropagation()}
+        style={{ width: 460, maxWidth: "92vw", maxHeight: "80vh", display: "flex", flexDirection: "column", background: C.surf, border: `1px solid ${C.border}`, borderRadius: 14, animation: "slideIn 0.22s ease both", boxShadow: "0 24px 60px rgba(0,0,0,0.5)" }}
+      >
+        <div style={{ padding: "20px 22px 12px", borderBottom: `1px solid ${C.border}`, flexShrink: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: subtitle ? 6 : 0 }}>
+            <div style={{ fontFamily: "'Cormorant', serif", fontSize: 22, fontWeight: 400, letterSpacing: "-0.01em" }}>{title}</div>
+            <button onClick={onClose} className="ghost" style={{ background: "transparent", border: "none", cursor: "pointer", color: C.text3, padding: 6, borderRadius: 6, display: "flex" }}>
+              <X size={15} />
+            </button>
+          </div>
+          {subtitle && <div style={{ fontSize: 12, color: C.text3, lineHeight: 1.5 }}>{subtitle}</div>}
+        </div>
+
+        <div style={{ flex: 1, overflowY: "auto", padding: "10px 12px 14px", minHeight: 120 }}>
+          {ordered.length === 0
+            ? <div style={{ padding: 24, textAlign: "center", color: C.text3, fontSize: 12 }}>No threads yet.</div>
+            : ordered.map(t => (
+                <MoveThreadNode
+                  key={t.id} thread={t} threads={threads} depth={0}
+                  excludeId={excludeId} onPick={onPick}
+                />
+              ))
+          }
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function ExportPickerNode({ thread, threads, depth, selectedIds, onToggle }) {
@@ -1317,10 +1517,41 @@ function SettingsModal({ theme, setTheme, prefs, setPrefs, threads, onClose }) {
   const [exportMsg, setExportMsg] = useState(null);
   const [showLlmPicker, setShowLlmPicker] = useState(false);
   const [widgetCfg, setWidgetCfg] = useState(null);
+  const [llmCfg, setLlmCfg] = useState(null);          // { hasKey, model, enabled }
+  const [apiKeyDraft, setApiKeyDraft] = useState("");
+  const [keyMsg, setKeyMsg] = useState(null);
+  const [memStatus, setMemStatus] = useState(null);    // { generatedAt, count }
+  const [memBusy, setMemBusy] = useState(false);
+  const [memMsg, setMemMsg] = useState(null);
 
   useEffect(() => {
     window.loomAPI?.getWidgetConfig?.().then(cfg => setWidgetCfg(cfg)).catch(() => {});
+    window.loomAPI?.getLlmConfig?.().then(cfg => setLlmCfg(cfg)).catch(() => {});
+    window.loomAPI?.getMemoryStatus?.().then(s => setMemStatus(s)).catch(() => {});
   }, []);
+
+  const setLlm = (patch) => {
+    window.loomAPI?.setLlmConfig?.(patch).then(cfg => setLlmCfg(cfg)).catch(() => {});
+  };
+  const saveKey = () => {
+    const k = apiKeyDraft.trim();
+    if (!k) return;
+    window.loomAPI?.setLlmConfig?.({ apiKey: k }).then(cfg => {
+      setLlmCfg(cfg); setApiKeyDraft(""); setKeyMsg("Saved"); setTimeout(() => setKeyMsg(null), 2000);
+    }).catch(() => {});
+  };
+  const clearKey = () => window.loomAPI?.setLlmConfig?.({ apiKey: "" }).then(cfg => setLlmCfg(cfg)).catch(() => {});
+  const rebuildMemory = () => {
+    setMemBusy(true); setMemMsg(null);
+    window.loomAPI?.buildMemory?.({ threads }).then(res => {
+      setMemBusy(false);
+      if (res?.ok) {
+        setMemStatus({ generatedAt: res.generatedAt, count: res.count });
+        setMemMsg(`Built ${res.count} profile${res.count === 1 ? "" : "s"}`);
+        setTimeout(() => setMemMsg(null), 2600);
+      } else setMemMsg(llmErrorText(res?.error));
+    }).catch(() => { setMemBusy(false); setMemMsg(llmErrorText()); });
+  };
 
   // Optimistically update local state and push the change to the main process.
   const setWidget = (patch) => {
@@ -1456,6 +1687,64 @@ function SettingsModal({ theme, setTheme, prefs, setPrefs, threads, onClose }) {
           </SettingsSection>
         )}
 
+        {llmCfg && (
+          <SettingsSection label="Smart Sort (AI)">
+            <SettingsRow label="Enable Smart Sort" hint="Let Claude suggest which thread a captured note belongs in. An entry's text is sent to Anthropic only when you run a suggestion.">
+              <ToggleSwitch checked={!!llmCfg.enabled} onChange={(v) => setLlm({ enabled: v })} />
+            </SettingsRow>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, padding: "10px 12px", border: `1px solid ${C.border}`, borderRadius: 9 }}>
+              <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                <span style={{ fontSize: 12.5, color: C.text, fontWeight: 500 }}>Anthropic API key</span>
+                <span style={{ fontSize: 11, color: C.text3, lineHeight: 1.4 }}>
+                  Stored only on this Mac (never synced, never shown again). Get one at console.anthropic.com.
+                  {llmCfg.hasUserKey
+                    ? <span style={{ color: C.gold }}> Key saved.</span>
+                    : llmCfg.usingDefaultKey
+                      ? <span style={{ color: C.text2 }}> Using the default key from .env.</span>
+                      : null}
+                </span>
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <input
+                  type="password"
+                  value={apiKeyDraft}
+                  onChange={(e) => setApiKeyDraft(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") saveKey(); }}
+                  placeholder={llmCfg.hasUserKey ? "Enter a new key to replace" : llmCfg.usingDefaultKey ? "Override the .env default…" : "sk-ant-…"}
+                  style={{ flex: 1, minWidth: 0, background: C.overlay, border: `1px solid ${C.border}`, borderRadius: 7, color: C.text, fontSize: 12, padding: "7px 10px", fontFamily: "'DM Sans', sans-serif" }}
+                />
+                <button
+                  onClick={saveKey}
+                  disabled={!apiKeyDraft.trim()}
+                  className="gold-btn"
+                  style={{ background: apiKeyDraft.trim() ? C.gold : C.goldDim, border: "none", borderRadius: 7, color: apiKeyDraft.trim() ? C.onGold : C.text3, fontSize: 12, padding: "7px 14px", cursor: apiKeyDraft.trim() ? "pointer" : "default", fontWeight: 500, flexShrink: 0 }}
+                >{keyMsg || "Save"}</button>
+                {llmCfg.hasUserKey && <ActionButton onClick={clearKey}>Clear</ActionButton>}
+              </div>
+            </div>
+
+            <SettingsRow label="Model" hint="Haiku is fast and cheap — the best fit for quick sorting.">
+              <SegSelect value={llmCfg.model} onChange={(v) => setLlm({ model: v })} options={MODEL_OPTS} />
+            </SettingsRow>
+
+            <SettingsRow
+              label="Thread memory"
+              hint={
+                memStatus?.count
+                  ? `${memStatus.count} profile${memStatus.count === 1 ? "" : "s"} · built ${formatTimestamp(memStatus.generatedAt)}. Rebuild after adding or renaming threads.`
+                  : "A compact summary of each thread so suggestions use fewer tokens. Optional — sorting still works from thread names."
+              }
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                {memMsg && <span style={{ fontSize: 11, color: /^Built/.test(memMsg) ? C.gold : C.danger }}>{memMsg}</span>}
+                {memBusy && <Spinner color={C.gold} size={13} />}
+                <ActionButton onClick={rebuildMemory}>{memBusy ? "Building…" : (memStatus?.count ? "Rebuild" : "Build")}</ActionButton>
+              </div>
+            </SettingsRow>
+          </SettingsSection>
+        )}
+
         <SettingsSection label="Data">
           <SettingsRow label="Export for LLM" hint="Pick threads and copy or save a markdown digest — paste into ChatGPT/Claude to ask questions about your Loom">
             <ActionButton onClick={() => setShowLlmPicker(true)}>Export…</ActionButton>
@@ -1480,6 +1769,148 @@ function SettingsModal({ theme, setTheme, prefs, setPrefs, threads, onClose }) {
           onClose={() => setShowLlmPicker(false)}
         />
       )}
+    </div>
+  );
+}
+
+// Journal-wide smart-sort review: asks Claude which entries would fit better in a
+// different thread, then lets you apply each move one at a time (falling back to
+// nothing if you skip). Display info is snapshotted at load time so applying a
+// move — which mutates the live thread list — doesn't scramble the remaining rows.
+//
+// Results (and which suggestions you've applied/skipped) live in the parent via
+// `state`/`setState`, so closing this modal to check something in Loom and
+// reopening it reuses the last pass instead of recomputing. Use "Rescan" for a
+// fresh pass after making changes.
+function ReviewModal({ threads, onApply, onClose, state, setState }) {
+  const status   = state?.status || "loading";
+  const items    = state?.items || [];
+  const errMsg   = state?.errMsg || null;
+  const resolved = state?.resolved || {};
+
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); onClose(); } };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  // Fetch a fresh pass. Snapshots entry text + thread titles so later applies
+  // (which mutate the live thread list) don't scramble the rendered rows.
+  const load = () => {
+    setState({ status: "loading", items: [], errMsg: null, resolved: {} });
+    const titleOf = (id) => (threads.find(t => t.id === id) || {}).title || (id === "inbox" ? "Inbox" : id);
+    const textOf = (eid) => {
+      for (const t of threads) {
+        const e = (t.entries || []).find(x => x.id === eid);
+        if (e) return e.text;
+      }
+      return "";
+    };
+    window.loomAPI?.reviewJournal?.({ threads }).then(res => {
+      if (!res?.ok) { setState({ status: "error", items: [], errMsg: llmErrorText(res?.error), resolved: {} }); return; }
+      const enriched = (res.suggestions || []).map(s => ({
+        ...s,
+        text: textOf(s.entryId),
+        fromTitle: titleOf(s.fromThreadId),
+        toTitle: titleOf(s.toThreadId),
+      }));
+      setState({ status: "ready", items: enriched, errMsg: null, resolved: {} });
+    }).catch(() => setState({ status: "error", items: [], errMsg: llmErrorText(), resolved: {} }));
+  };
+
+  // Compute only if there's nothing cached (or a prior load was cut off mid-flight
+  // by an earlier close). A cached "ready"/"error" result is reused as-is.
+  useEffect(() => {
+    if (!state || state.status === "loading") load();
+  // Run once on mount; reuse cached results otherwise.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const accept = (it) => { onApply(it.fromThreadId, it.entryId, it.toThreadId); setState(s => ({ ...s, resolved: { ...s.resolved, [it.entryId]: "applied" } })); };
+  const skip   = (it) => setState(s => ({ ...s, resolved: { ...s.resolved, [it.entryId]: "skipped" } }));
+
+  const pending = items.filter(it => !resolved[it.entryId]).length;
+
+  return (
+    <div
+      onClick={e => { e.stopPropagation(); onClose(); }}
+      style={{ position: "fixed", inset: 0, background: C.scrim, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 320, animation: "fadeIn 0.18s ease both", backdropFilter: "blur(6px)" }}
+    >
+      <div
+        onClick={e => e.stopPropagation()}
+        style={{ width: 560, maxWidth: "92vw", maxHeight: "82vh", display: "flex", flexDirection: "column", background: C.surf, border: `1px solid ${C.border}`, borderRadius: 14, animation: "slideIn 0.22s ease both", boxShadow: "0 24px 60px rgba(0,0,0,0.5)" }}
+      >
+        <div style={{ padding: "20px 22px 14px", borderBottom: `1px solid ${C.border}`, flexShrink: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
+              <Sparkles size={16} color={C.gold} />
+              <div style={{ fontFamily: "'Cormorant', serif", fontSize: 22, fontWeight: 400, letterSpacing: "-0.01em" }}>Review placements</div>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              {status !== "loading" && (
+                <button onClick={load} className="ghost" title="Run a fresh pass over your entries" style={{ background: "transparent", border: `1px solid ${C.border}`, borderRadius: 7, cursor: "pointer", color: C.text2, fontSize: 11.5, padding: "5px 10px", display: "flex", alignItems: "center", gap: 5 }}>
+                  <Sparkles size={11} /> Rescan
+                </button>
+              )}
+              <button onClick={onClose} className="ghost" style={{ background: "transparent", border: "none", cursor: "pointer", color: C.text3, padding: 6, borderRadius: 6, display: "flex" }}>
+                <X size={15} />
+              </button>
+            </div>
+          </div>
+          <div style={{ fontSize: 12, color: C.text3, lineHeight: 1.5, marginTop: 6 }}>
+            Entries Claude thinks would fit better in another thread. Apply the ones you agree with.
+          </div>
+        </div>
+
+        <div style={{ flex: 1, overflowY: "auto", padding: "14px 16px 16px", minHeight: 140 }}>
+          {status === "loading" && (
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "40px 0", color: C.text3, fontSize: 13 }}>
+              <Spinner color={C.gold} size={15} /> Looking through your entries…
+            </div>
+          )}
+          {status === "error" && (
+            <div style={{ padding: "40px 0", textAlign: "center", color: C.danger, fontSize: 13 }}>{errMsg}</div>
+          )}
+          {status === "ready" && items.length === 0 && (
+            <div style={{ padding: "40px 0", textAlign: "center", color: C.text3, fontSize: 13.5 }}>Everything looks well-placed.</div>
+          )}
+          {status === "ready" && items.length > 0 && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {items.map(it => {
+                const state = resolved[it.entryId];
+                return (
+                  <div key={it.entryId} style={{ background: C.surf2, border: `1px solid ${C.border}`, borderRadius: 10, padding: "12px 14px", opacity: state ? 0.55 : 1 }}>
+                    <div style={{ fontSize: 13, color: C.entryText, lineHeight: 1.55, marginBottom: 8, whiteSpace: "pre-wrap" }}>{it.text}</div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 11.5, color: C.text2, marginBottom: it.reason ? 6 : 10, flexWrap: "wrap" }}>
+                      <span style={{ color: C.text3 }}>{it.fromTitle}</span>
+                      <ChevronRight size={12} color={C.text3} />
+                      <span style={{ color: C.gold, fontWeight: 600 }}>{it.toTitle}</span>
+                    </div>
+                    {it.reason && <div style={{ fontSize: 11.5, color: C.text3, lineHeight: 1.5, marginBottom: 10 }}>{it.reason}</div>}
+                    {state ? (
+                      <div style={{ fontSize: 11.5, color: state === "applied" ? C.gold : C.text3, display: "flex", alignItems: "center", gap: 5 }}>
+                        {state === "applied" ? <><Check size={12} /> Moved to {it.toTitle}</> : "Skipped"}
+                      </div>
+                    ) : (
+                      <div style={{ display: "flex", gap: 8 }}>
+                        <button onClick={() => accept(it)} className="gold-btn" style={{ background: C.gold, border: "none", borderRadius: 6, color: C.onGold, fontSize: 11.5, padding: "5px 13px", cursor: "pointer", fontWeight: 500 }}>Move</button>
+                        <button onClick={() => skip(it)} className="ghost" style={{ background: "transparent", border: `1px solid ${C.border}`, borderRadius: 6, color: C.text2, fontSize: 11.5, padding: "5px 13px", cursor: "pointer" }}>Skip</button>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        {status === "ready" && items.length > 0 && (
+          <div style={{ padding: "12px 16px", borderTop: `1px solid ${C.border}`, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <span style={{ fontSize: 11.5, color: C.text3 }}>{pending} of {items.length} pending</span>
+            <ActionButton onClick={onClose}>Done</ActionButton>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -1586,6 +2017,9 @@ function SbThreadTree({ thread, allThreads, view, go, depth, collapsed, toggleCo
   // Pointer position when the drag began, used to tell a real drag from the
   // browser starting a phantom drag on a click that had a few px of jitter.
   const dragOrigin = useRef(null);
+  // Last real pointer position seen during the drag. `dragend` in Chromium
+  // frequently reports (0,0), so we can't trust its coordinates directly.
+  const dragLast = useRef(null);
 
   const handleRowClick = (e) => {
     e.stopPropagation();
@@ -1595,12 +2029,23 @@ function SbThreadTree({ thread, allThreads, view, go, depth, collapsed, toggleCo
     }
     clearSelection?.();
     go(thread.id);
+    // Reveal sub-threads on open. Only ever expand here — collapsing stays the
+    // arrow's job, so clicking an already-open thread doesn't fold it shut.
+    if (hasKids && !isOpen) toggleCollapse(thread.id);
   };
 
   const handleDragStart = (e) => {
     e.stopPropagation();
     dragOrigin.current = { x: e.clientX, y: e.clientY };
+    dragLast.current = { x: e.clientX, y: e.clientY };
     startThreadDrag(thread.id);
+  };
+
+  const handleDrag = (e) => {
+    // `drag` fires continuously while dragging. Chromium sprinkles in (0,0)
+    // events, so only remember positions that look real — this is the reliable
+    // record of where the pointer actually ended up.
+    if (e.clientX || e.clientY) dragLast.current = { x: e.clientX, y: e.clientY };
   };
 
   const handleDragEnd = (e) => {
@@ -1610,9 +2055,15 @@ function SbThreadTree({ thread, allThreads, view, go, depth, collapsed, toggleCo
     // jitter). Recover that swallowed click: if this "drag" never really moved,
     // treat it as a click so a single press reliably opens the thread.
     const origin = dragOrigin.current;
+    const last   = dragLast.current;
     dragOrigin.current = null;
+    dragLast.current = null;
     if (!origin) return;
-    const moved = Math.abs(e.clientX - origin.x) + Math.abs(e.clientY - origin.y);
+    // `dragend`'s own coordinates are unreliable (Chromium routinely reports
+    // (0,0)), which would make a still click look like a big move and swallow
+    // it. Measure against the last real pointer position instead.
+    const end = (e.clientX || e.clientY) ? { x: e.clientX, y: e.clientY } : (last || origin);
+    const moved = Math.abs(end.x - origin.x) + Math.abs(end.y - origin.y);
     if (moved < 5) handleRowClick(e);
   };
 
@@ -1635,6 +2086,7 @@ function SbThreadTree({ thread, allThreads, view, go, depth, collapsed, toggleCo
       <div
         draggable
         onDragStart={handleDragStart}
+        onDrag={handleDrag}
         onDragOver={handleDragOver}
         onDrop={e => { e.stopPropagation(); handleThreadDrop(); }}
         onDragEnd={handleDragEnd}
@@ -1711,7 +2163,7 @@ function SbThreadTree({ thread, allThreads, view, go, depth, collapsed, toggleCo
 // ─────────────────────────────────────────────────────────────
 // HOME VIEW
 // ─────────────────────────────────────────────────────────────
-function HomeView({ threads, rootThreads, go, setShowNew, addEntry, forms, onFillForm, onSkipForm }) {
+function HomeView({ threads, rootThreads, go, setShowNew, addEntry, forms, onFillForm, onSkipForm, smartSortReady = false, onReview }) {
   const [capture, setCapture] = useState("");
   const hrs     = new Date().getHours();
   const greet   = hrs < 12 ? "Good morning" : hrs < 17 ? "Good afternoon" : "Good evening";
@@ -1736,7 +2188,19 @@ function HomeView({ threads, rootThreads, go, setShowNew, addEntry, forms, onFil
 
       <div style={{ animation: "fadeUp 0.45s 0.08s ease both", marginBottom: 56 }}>
         <div style={{ background: C.surf, border: `1px solid ${C.border}`, borderRadius: 16, padding: "22px 26px" }}>
-          <div style={{ fontSize: 11, color: C.text3, letterSpacing: "0.07em", textTransform: "uppercase", marginBottom: 14, fontWeight: 500 }}>Quick Capture</div>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 14 }}>
+            <div style={{ fontSize: 11, color: C.text3, letterSpacing: "0.07em", textTransform: "uppercase", fontWeight: 500 }}>Quick Capture</div>
+            {smartSortReady && (
+              <button
+                onClick={onReview}
+                className="ghost"
+                title="Ask Claude to find entries that belong in a different thread"
+                style={{ display: "inline-flex", alignItems: "center", gap: 6, background: "transparent", border: `1px solid ${C.goldBorder}`, borderRadius: 7, color: C.gold, fontSize: 11.5, padding: "5px 11px", cursor: "pointer" }}
+              >
+                <Sparkles size={12} /> Review placements
+              </button>
+            )}
+          </div>
           <textarea value={capture} onChange={e => setCapture(e.target.value)}
             onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); doCapture(); } }}
             placeholder="Capture a thought -- goes straight to Inbox for triage later..."
@@ -1859,7 +2323,7 @@ function FormsView({ forms, threads, onNew, onEdit, onFill, onDelete }) {
                   <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
                     <button onClick={() => onFill(f.id)} className="gold-btn" style={{ background: C.gold, border: "none", borderRadius: 8, color: C.onGold, fontSize: 12, padding: "7px 14px", cursor: "pointer", fontWeight: 500 }}>Fill out</button>
                     <ActionButton onClick={() => onEdit(f.id)}>Edit</ActionButton>
-                    <button onClick={() => { if (window.confirm(`Delete "${f.title || "Untitled form"}"? This can't be undone.`)) onDelete(f.id); }} className="ghost" style={{ background: "transparent", border: `1px solid ${C.border}`, borderRadius: 7, color: "#D67878", padding: 7, cursor: "pointer", display: "flex" }}>
+                    <button onClick={() => { loomConfirm({ title: "Delete form?", message: `Delete "${f.title || "Untitled form"}"? This can't be undone.` }).then(ok => { if (ok) onDelete(f.id); }); }} className="ghost" style={{ background: "transparent", border: `1px solid ${C.border}`, borderRadius: 7, color: "#D67878", padding: 7, cursor: "pointer", display: "flex" }}>
                       <Trash2 size={13} />
                     </button>
                   </div>
@@ -1879,12 +2343,16 @@ function FormsView({ forms, threads, onNew, onEdit, onFill, onDelete }) {
 function FormFill({ form, threads, onSubmit, onClose }) {
   const [answers, setAnswers] = useState({});
   const [err, setErr] = useState(null);
+  const [submitState, setSubmitState] = useState("idle"); // idle | submitting | done
+  const submitTimer = useRef(null);
 
   useEffect(() => {
-    const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); onClose(); } };
+    const onKey = (e) => { if (e.key === "Escape" && submitState === "idle") { e.stopPropagation(); onClose(); } };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [onClose, submitState]);
+
+  useEffect(() => () => clearTimeout(submitTimer.current), []);
 
   const setAns = (qid, val) => setAnswers(a => ({ ...a, [qid]: val }));
   const toggleMulti = (qid, opt) => setAnswers(a => {
@@ -1893,9 +2361,17 @@ function FormFill({ form, threads, onSubmit, onClose }) {
   });
 
   const submit = () => {
+    if (submitState !== "idle") return;
     const missing = form.questions.find(q => q.required && !isAnswered(q, answers[q.id]));
     if (missing) { setErr(`"${missing.label || "Untitled question"}" is required.`); return; }
-    onSubmit(answers);
+    setErr(null);
+    // Hold on a "Submitting…" → "Submitted ✓" beat so the action reads clearly
+    // before the modal disappears (it used to just vanish with no feedback).
+    setSubmitState("submitting");
+    submitTimer.current = setTimeout(() => {
+      setSubmitState("done");
+      submitTimer.current = setTimeout(() => onSubmit(answers), 550);
+    }, 260);
   };
 
   const inputStyle = { width: "100%", background: C.surf2, border: `1px solid ${C.border}`, borderRadius: 10, color: C.text, fontSize: 14, padding: "11px 14px", fontWeight: 300 };
@@ -1962,8 +2438,24 @@ function FormFill({ form, threads, onSubmit, onClose }) {
         <div style={{ padding: "12px 24px 16px", borderTop: `1px solid ${C.border}`, display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
           {err && <span style={{ fontSize: 11.5, color: "#E08A8A" }}>{err}</span>}
           <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
-            <ActionButton onClick={onClose}>Cancel</ActionButton>
-            <button onClick={submit} className="gold-btn" style={{ background: C.gold, border: "none", borderRadius: 8, color: C.onGold, fontSize: 12.5, padding: "8px 18px", cursor: "pointer", fontWeight: 500 }}>Submit</button>
+            {submitState === "idle" && <ActionButton onClick={onClose}>Cancel</ActionButton>}
+            <button
+              onClick={submit}
+              disabled={submitState !== "idle"}
+              className="gold-btn"
+              style={{
+                background: submitState === "done" ? C.gold : (submitState === "submitting" ? C.goldDim : C.gold),
+                border: "none", borderRadius: 8, color: submitState === "submitting" ? C.gold : C.onGold,
+                fontSize: 12.5, padding: "8px 18px", fontWeight: 500,
+                cursor: submitState === "idle" ? "pointer" : "default",
+                display: "flex", alignItems: "center", gap: 6, minWidth: 96, justifyContent: "center",
+                transition: "background 0.2s ease, color 0.2s ease",
+              }}
+            >
+              {submitState === "idle" && "Submit"}
+              {submitState === "submitting" && (<><Spinner color={C.gold} /> Submitting…</>)}
+              {submitState === "done" && (<><span style={{ display: "inline-flex", animation: "popIn 0.25s ease both" }}><Check size={13} strokeWidth={2.5} /></span> Submitted</>)}
+            </button>
           </div>
         </div>
       </div>
@@ -2437,7 +2929,7 @@ function SortOrderToggle({ order, onChange, accent }) {
   );
 }
 
-function ThreadView({ thread, threads, go, setShowNew, addEntry, addEntries, updateEntry, toggleCheck, pinEntry, setDueDate, setEntryDate, deleteEntry, moveEntry, reorderEntries, renameThread, setThreadDescription, setThreadDisplayMode, setThreadSortOrder, deleteThread, selectedEntryIds, toggleEntrySelection, showDoneDefault = false }) {
+function ThreadView({ thread, threads, go, setShowNew, addEntry, addEntries, updateEntry, toggleCheck, pinEntry, setDueDate, setEntryDate, deleteEntry, moveEntry, reorderEntries, renameThread, setThreadDescription, setThreadDisplayMode, setThreadSortOrder, deleteThread, selectedEntryIds, toggleEntrySelection, showDoneDefault = false, smartSortReady = false }) {
   const cfg      = TYPES[thread.type];
   const Icon     = cfg.icon;
   const isBoard  = thread.type === "board";
@@ -2452,6 +2944,7 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, addEntries, upd
   const [dragId, setDragId]             = useState(null);
   const [dropId, setDropId]             = useState(null);
   const [dropPos, setDropPos]           = useState("before"); // "before" | "after" the dropId row
+  const [dropRoot, setDropRoot]         = useState(false);    // hovering the "eject to top level" zone
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft]     = useState(thread.title);
   const [editingDesc, setEditingDesc]   = useState(false);
@@ -2480,7 +2973,7 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, addEntries, upd
     const msg = kidCount > 0
       ? `Delete "${thread.title}"? Its ${kidCount} sub-thread${kidCount > 1 ? "s" : ""} will move up one level.`
       : `Delete "${thread.title}"? This can't be undone.`;
-    if (window.confirm(msg)) deleteThread(thread.id);
+    loomConfirm({ title: "Delete thread?", message: msg }).then(ok => { if (ok) deleteThread(thread.id); });
   };
 
   const displayMode = thread.displayMode === "compact" ? "compact" : "list";   // per-thread: "list" | "compact"
@@ -2537,7 +3030,11 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, addEntries, upd
     return a && b && (a.parentEntryId || null) === (b.parentEntryId || null);
   };
   const canDropOn = (targetId) => !!dragId && dragId !== targetId && sameSiblings(dragId, targetId);
-  const endDrag = () => { setDragId(null); setDropId(null); };
+  const endDrag = () => { setDragId(null); setDropId(null); setDropRoot(false); };
+
+  // The reply currently being dragged, if any — a top-level entry can't be "ejected".
+  const draggedEntry  = dragId ? thread.entries.find(e => e.id === dragId) : null;
+  const draggingReply = !!draggedEntry?.parentEntryId;
 
   const handleDrop = (targetId, pos) => {
     if (!canDropOn(targetId)) { endDrag(); return; }
@@ -2547,6 +3044,17 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, addEntries, upd
     let to = entries.findIndex(e => e.id === targetId);
     if (pos === "after") to += 1;
     entries.splice(to, 0, moved);
+    reorderEntries(thread.id, entries);
+    endDrag();
+  };
+
+  // Eject a reply out of its parent so it becomes a top-level entry. Lands at the
+  // end of the array (top-level entries render in array order under manual sort).
+  const handleEjectToRoot = () => {
+    if (!draggingReply) { endDrag(); return; }
+    const entries = [...thread.entries];
+    const [moved] = entries.splice(entries.findIndex(e => e.id === dragId), 1);
+    entries.push({ ...moved, parentEntryId: null });
     reorderEntries(thread.id, entries);
     endDrag();
   };
@@ -2584,9 +3092,10 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, addEntries, upd
     toggleCheck, pinEntry, setDueDate, setEntryDate, deleteEntry, updateEntry,
     editingId, setEditingId,
     onReply: (entry) => { setReplyingTo(entry); setTimeout(() => taRef.current?.focus(), 0); },
-    isBoard, isInbox, otherThreads, moveEntry,
+    isBoard, isInbox, otherThreads, allThreads: threads, moveEntry,
     childrenOf, layout: displayMode,
     selectedEntryIds, toggleEntrySelection,
+    smartSortReady,
   };
 
   return (
@@ -2726,6 +3235,25 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, addEntries, upd
         {thread.entries.length === 0 && children.length === 0 && (
           <div style={{ textAlign: "center", padding: "48px 0", color: C.text3, fontSize: 14 }}>
             {isInbox ? "Your inbox is clear." : "No entries yet. Add the first one below."}
+          </div>
+        )}
+
+        {/* Eject-to-root zone — only while dragging a reply; drop here to pull it out
+            of its parent and make it a top-level entry. */}
+        {draggingReply && (
+          <div
+            className={`root-drop ${dropRoot ? "active" : ""}`}
+            style={{
+              padding: "9px 12px", fontSize: 11, textAlign: "center",
+              color: dropRoot ? C.gold : C.text3,
+              border: `1px dashed ${dropRoot ? "rgba(200,165,100,0.4)" : C.dashed}`,
+              marginBottom: 10, cursor: "copy",
+            }}
+            onDragOver={e => { e.preventDefault(); setDropRoot(true); }}
+            onDragLeave={() => setDropRoot(false)}
+            onDrop={handleEjectToRoot}
+          >
+            Drop here to make a top-level entry
           </div>
         )}
 
@@ -2953,23 +3481,64 @@ function EntryTreeNode({ entry, depth, i, childrenOf, layout = "list", canDrag, 
   );
 }
 
+// Inline result card for a single smart-sort suggestion (shown under an Inbox
+// entry). Accepting moves the entry; "Choose manually" falls back to the
+// existing thread picker; dismiss just clears the card.
+function SortSuggestion({ suggestion, threads, onAccept, onReject, onDismiss }) {
+  const target = suggestion?.threadId ? threads.find(t => t.id === suggestion.threadId) : null;
+  const pct = Math.round((suggestion?.confidence || 0) * 100);
+  const dismissBtn = (
+    <button onClick={onDismiss} className="ghost" style={{ background: "transparent", border: "none", color: C.text3, fontSize: 11.5, padding: "5px 6px", cursor: "pointer" }}>Dismiss</button>
+  );
+  return (
+    <div style={{ marginTop: 8, background: C.surf2, border: `1px solid ${C.goldBorder}`, borderRadius: 9, padding: "10px 12px", animation: "fadeIn 0.16s ease both" }}>
+      {target ? (
+        <>
+          <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 4 }}>
+            <Sparkles size={12} color={C.gold} />
+            <span style={{ fontSize: 12, color: C.text }}>Suggested: <strong style={{ color: C.gold, fontWeight: 600 }}>{target.title}</strong></span>
+            {pct > 0 && <span style={{ fontSize: 10.5, color: C.text3 }}>{pct}% sure</span>}
+          </div>
+          {suggestion.reason && <div style={{ fontSize: 11.5, color: C.text2, lineHeight: 1.5, marginBottom: 9 }}>{suggestion.reason}</div>}
+          <div style={{ display: "flex", gap: 8 }}>
+            <button onClick={onAccept} className="gold-btn" style={{ background: C.gold, border: "none", borderRadius: 6, color: C.onGold, fontSize: 11.5, padding: "5px 12px", cursor: "pointer", fontWeight: 500 }}>Move here</button>
+            <button onClick={onReject} className="ghost" style={{ background: "transparent", border: `1px solid ${C.border}`, borderRadius: 6, color: C.text2, fontSize: 11.5, padding: "5px 12px", cursor: "pointer" }}>Choose manually</button>
+            {dismissBtn}
+          </div>
+        </>
+      ) : (
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+          <span style={{ fontSize: 11.5, color: C.text2 }}>No clear match — file it manually.</span>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button onClick={onReject} className="ghost" style={{ background: "transparent", border: `1px solid ${C.border}`, borderRadius: 6, color: C.text2, fontSize: 11.5, padding: "5px 12px", cursor: "pointer" }}>Choose thread…</button>
+            {dismissBtn}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── ENTRY ROW ───
-function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, setDueDate, setEntryDate, deleteEntry, updateEntry, editingId, setEditingId, onReply, isBoard, isInbox, otherThreads, moveEntry, layout = "list", draggable: isDraggable, dragId, dropId, dropPos, onDragStart, onDragOver, onDrop, onDragEnd, i, selectedEntryIds, toggleEntrySelection }) {
+function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, setDueDate, setEntryDate, deleteEntry, updateEntry, editingId, setEditingId, onReply, isBoard, isInbox, otherThreads, allThreads = [], moveEntry, layout = "list", draggable: isDraggable, dragId, dropId, dropPos, onDragStart, onDragOver, onDrop, onDragEnd, i, selectedEntryIds, toggleEntrySelection, smartSortReady = false }) {
   const [editText, setEditText] = useState(entry.text);
   const [moveOpen, setMoveOpen] = useState(false);
+  const [sortState, setSortState] = useState(null); // null | {status:"loading"} | {status:"error",msg} | {status:"done",suggestion}
   const editRef  = useRef(null);
-  const moveRef  = useRef(null);
+
+  const runSmartSort = async () => {
+    setSortState({ status: "loading" });
+    try {
+      const res = await window.loomAPI?.suggestSort?.({ entryText: entry.text, threads: allThreads });
+      if (!res?.ok) { setSortState({ status: "error", msg: llmErrorText(res?.error) }); return; }
+      setSortState({ status: "done", suggestion: res.suggestion });
+    } catch {
+      setSortState({ status: "error", msg: llmErrorText() });
+    }
+  };
   const dateInputRef = useRef(null);
   const entryDateInputRef = useRef(null);
 
-  useEffect(() => {
-    if (!moveOpen) return;
-    const onDocClick = (e) => { if (!moveRef.current?.contains(e.target)) setMoveOpen(false); };
-    const onKey = (e) => { if (e.key === "Escape") setMoveOpen(false); };
-    document.addEventListener("mousedown", onDocClick);
-    document.addEventListener("keydown", onKey);
-    return () => { document.removeEventListener("mousedown", onDocClick); document.removeEventListener("keydown", onKey); };
-  }, [moveOpen]);
   const isEditing  = editingId === entry.id;
   const isDropTarget = dropId === entry.id && dragId !== entry.id;   // show insertion line
   const isDragging   = dragId === entry.id;                          // this row is being dragged
@@ -3040,6 +3609,7 @@ function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, setDueDat
   };
 
   return (
+    <>
     <div className={`e-row ${isSelected ? "selected" : ""}`}
       draggable={isDraggable && !isEditing}
       onDragStart={onDragStart} onDragOver={onDragOver} onDrop={onDrop} onDragEnd={onDragEnd}
@@ -3130,11 +3700,39 @@ function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, setDueDat
         )}
         {isInbox && !isEditing && otherThreads.length > 0 && (
           <div style={{ marginTop: 10 }}>
-            <select className="move-select" value="" onChange={e => { if (e.target.value) { moveEntry(threadId, entry.id, e.target.value); e.target.value = ""; } }}
-              style={{ background: C.surf2, border: `1px solid ${C.border}`, borderRadius: 7, color: C.text2, fontSize: 11.5, padding: "5px 10px", cursor: "pointer" }}>
-              <option value="">Move to thread...</option>
-              {otherThreads.map(t => <option key={t.id} value={t.id}>{t.id === "inbox" ? "Inbox" : (t.title.length > 40 ? t.title.slice(0, 40) + "..." : t.title)}</option>)}
-            </select>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {smartSortReady && (
+                <button
+                  className="ghost"
+                  onClick={runSmartSort}
+                  disabled={sortState?.status === "loading"}
+                  title="Suggest a thread with Claude"
+                  style={{ display: "inline-flex", alignItems: "center", gap: 6, background: C.goldDim, border: `1px solid ${C.goldBorder}`, borderRadius: 7, color: C.gold, fontSize: 11.5, padding: "5px 10px", cursor: sortState?.status === "loading" ? "default" : "pointer" }}
+                >
+                  {sortState?.status === "loading" ? <Spinner color={C.gold} size={11} /> : <Sparkles size={11} />} Smart sort
+                </button>
+              )}
+              <button
+                className="ghost"
+                onClick={() => setMoveOpen(true)}
+                title="Move to another thread"
+                style={{ display: "inline-flex", alignItems: "center", gap: 6, background: C.surf2, border: `1px solid ${C.border}`, borderRadius: 7, color: C.text2, fontSize: 11.5, padding: "5px 10px", cursor: "pointer" }}
+              >
+                <FolderInput size={11} /> Move to thread…
+              </button>
+            </div>
+            {sortState?.status === "error" && (
+              <div style={{ marginTop: 8, fontSize: 11.5, color: C.danger }}>{sortState.msg}</div>
+            )}
+            {sortState?.status === "done" && (
+              <SortSuggestion
+                suggestion={sortState.suggestion}
+                threads={allThreads}
+                onAccept={() => { moveEntry(threadId, entry.id, sortState.suggestion.threadId); setSortState(null); }}
+                onReject={() => { setSortState(null); setMoveOpen(true); }}
+                onDismiss={() => setSortState(null)}
+              />
+            )}
           </div>
         )}
       </div>
@@ -3172,51 +3770,93 @@ function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, setDueDat
             </span>
           )}
           {!isInbox && otherThreads.length > 0 && (
-            <span ref={moveRef} style={{ position: "relative", display: "inline-flex" }}>
-              <button
-                className="ghost"
-                onClick={() => setMoveOpen(o => !o)}
-                title="Move to another thread"
-                style={{ background: "transparent", border: "none", cursor: "pointer", padding: 5, borderRadius: 5, display: "flex" }}
-              >
-                <FolderInput size={12} color={moveOpen ? C.gold : C.text3} />
-              </button>
-              {moveOpen && (
-                <div
-                  style={{
-                    position: "absolute", right: 0, bottom: "calc(100% + 6px)", zIndex: 200,
-                    background: C.surf2, border: `1px solid ${C.border}`, borderRadius: 9,
-                    boxShadow: "0 10px 28px rgba(0,0,0,0.4)", padding: 5, minWidth: 180,
-                    maxHeight: 280, overflowY: "auto",
-                  }}
-                >
-                  <div style={{ fontSize: 10.5, color: C.text3, padding: "4px 8px 6px", textTransform: "uppercase", letterSpacing: "0.05em" }}>Move to</div>
-                  {otherThreads.map(t => (
-                    <button
-                      key={t.id}
-                      className="ghost"
-                      onClick={() => { moveEntry(threadId, entry.id, t.id); setMoveOpen(false); }}
-                      style={{ display: "block", width: "100%", textAlign: "left", background: "transparent", border: "none", color: C.text2, fontSize: 12.5, padding: "6px 8px", borderRadius: 6, cursor: "pointer", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
-                    >
-                      {t.id === "inbox" ? "Inbox" : t.title}
-                    </button>
-                  ))}
-                </div>
-              )}
-            </span>
+            <button
+              className="ghost"
+              onClick={() => setMoveOpen(true)}
+              title="Move to another thread"
+              style={{ background: "transparent", border: "none", cursor: "pointer", padding: 5, borderRadius: 5, display: "flex" }}
+            >
+              <FolderInput size={12} color={moveOpen ? C.gold : C.text3} />
+            </button>
           )}
-          <button className="ghost" onClick={() => deleteEntry(threadId, entry.id)} style={{ background: "transparent", border: "none", cursor: "pointer", padding: 5, borderRadius: 5, display: "flex" }}>
+          <button className="ghost" onClick={() => { loomConfirm({ title: "Delete entry?", message: "Delete this entry? This can't be undone." }).then(ok => { if (ok) deleteEntry(threadId, entry.id); }); }} style={{ background: "transparent", border: "none", cursor: "pointer", padding: 5, borderRadius: 5, display: "flex" }}>
             <X size={12} color={C.text3} />
           </button>
         </div>
       )}
     </div>
+    {moveOpen && (
+      <MoveToThreadModal
+        threads={allThreads}
+        excludeId={threadId}
+        title="Move entry"
+        subtitle="Choose a destination thread."
+        onPick={(tid) => { moveEntry(threadId, entry.id, tid); setMoveOpen(false); }}
+        onClose={() => setMoveOpen(false)}
+      />
+    )}
+    </>
   );
 }
 
 // ─────────────────────────────────────────────────────────────
 // NEW THREAD MODAL
 // ─────────────────────────────────────────────────────────────
+// Mounted once in Loom; renders the confirm modal on demand via loomConfirm().
+function ConfirmHost() {
+  const [state, setState] = useState(null);
+  useEffect(() => { confirmSetter = setState; return () => { confirmSetter = null; }; }, []);
+  if (!state) return null;
+  const finish = (val) => { state.resolve(val); setState(null); };
+  return (
+    <ConfirmModal
+      title={state.title}
+      message={state.message}
+      confirmLabel={state.confirmLabel}
+      cancelLabel={state.cancelLabel}
+      danger={state.danger !== false}
+      onConfirm={() => finish(true)}
+      onCancel={() => finish(false)}
+    />
+  );
+}
+
+function ConfirmModal({ title = "Are you sure?", message, confirmLabel = "Delete", cancelLabel = "Cancel", danger = true, onConfirm, onCancel }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    ref.current?.focus();
+    const onKey = (e) => {
+      if (e.key === "Escape") { e.preventDefault(); onCancel(); }
+      if (e.key === "Enter")  { e.preventDefault(); onConfirm(); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onConfirm, onCancel]);
+  const accent  = danger ? C.danger : C.gold;
+  const onAcc   = danger ? C.onDanger : C.onGold;
+  return (
+    <div onMouseDown={onCancel} style={{ position: "fixed", inset: 0, background: C.scrim, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 300, animation: "fadeIn 0.18s ease both", backdropFilter: "blur(6px)" }}>
+      <div onMouseDown={e => e.stopPropagation()} style={{ background: C.modalSurf, border: `1px solid ${C.border}`, borderRadius: 18, padding: "30px", width: 380, animation: "slideIn 0.22s ease both", boxShadow: "0 32px 80px rgba(0,0,0,0.5)" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 14 }}>
+          <div style={{ width: 34, height: 34, borderRadius: 9, background: danger ? C.dangerBg : C.goldDim, border: `1px solid ${danger ? C.dangerBorder : C.goldBorder}`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+            <AlertCircle size={17} color={accent} />
+          </div>
+          <div style={{ fontFamily: "'Cormorant', serif", fontSize: 23, fontWeight: 400 }}>{title}</div>
+        </div>
+        {message && <div style={{ fontSize: 13.5, color: C.text2, lineHeight: 1.55, marginBottom: 26, fontWeight: 300 }}>{message}</div>}
+        <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+          <button onClick={onCancel} className="ghost" style={{ background: "transparent", border: `1px solid ${C.border}`, borderRadius: 10, color: C.text2, fontSize: 13.5, padding: "10px 18px", fontWeight: 500, cursor: "pointer" }}>
+            {cancelLabel}
+          </button>
+          <button ref={ref} onClick={onConfirm} style={{ background: accent, border: "none", borderRadius: 10, color: onAcc, fontSize: 13.5, padding: "10px 20px", fontWeight: 600, cursor: "pointer" }}>
+            {confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function NewModal({ title, setTitle, description, setDescription, type, setType, parentId, parentThread, onCreate, onClose }) {
   const ref = useRef(null);
   useEffect(() => { ref.current?.focus(); }, []);
