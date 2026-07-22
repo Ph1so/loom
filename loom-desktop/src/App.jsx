@@ -2672,6 +2672,9 @@ function QuestionEditor({ q, idx, total, grouping, threadOptions, onChange, onMo
 
 function SmartSurface({ threads, allThreads, go }) {
   const items = [];
+  // Entries already surfaced as their own "due" card, so the per-thread "action"
+  // card below doesn't list them again (one copy only — the one with the badge).
+  const surfaced = new Set();
   // Overdue / due-soon board entries across ALL threads (time-sensitive → first).
   (allThreads || threads).filter(t => t.type === "board" && t.id !== "inbox").forEach(t => {
     t.entries.forEach(e => {
@@ -2679,11 +2682,12 @@ function SmartSurface({ threads, allThreads, go }) {
       const diff = dueDayDiff(e.dueDate);
       if (diff === null || diff > 7) return; // only overdue or within a week
       items.push({ kind: "due", thread: t, entry: e, diff });
+      surfaced.add(e.id);
     });
   });
   items.sort((a, b) => a.diff - b.diff); // most overdue first (only due items present here)
   threads.filter(t => t.type === "board").forEach(t => {
-    const pending = t.entries.filter(e => !e.checked && e.subtype !== "note");
+    const pending = t.entries.filter(e => !e.checked && e.subtype !== "note" && !surfaced.has(e.id));
     if (pending.length > 0) {
       const pinned = pending.filter(e => e.pinned);
       items.push({ kind: "action", thread: t, pending: pending.length, topTask: (pinned[0] || pending[0]).text });
