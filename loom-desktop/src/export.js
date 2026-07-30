@@ -8,7 +8,8 @@
 // nested bullets with a `↳` marker. Boards get `[x]`/`[ ]` checkboxes; pinned
 // entries get 📌; due dates render as `· due:YYYY-MM-DD` with a relative verdict
 // like `(OVERDUE by 3d)`; subtype "note" entries render with an italic *(note)*
-// tag.
+// tag; archived entries render with an italic *(archived)* tag and are excluded
+// from board task/open counts (they're kept for the record but not "live").
 //
 // Everything temporal is computed relative to the export date (opts.now) so the
 // reader never has to do date math.
@@ -123,7 +124,8 @@ function threadFacts(thread, now) {
   const undated = entries.filter(e => !e.dateISO).length;
   const isBoard = thread.type === "board";
   // Notes are plain text, never tasks — exclude them from board task counts.
-  const tasks = isBoard ? entries.filter(e => e.subtype !== "note") : [];
+  // Archived tasks are deliberately out of the way — exclude them too.
+  const tasks = isBoard ? entries.filter(e => e.subtype !== "note" && !e.archived) : [];
   const open = isBoard ? tasks.filter(e => !e.checked).length : 0;
   const done = isBoard ? tasks.filter(e => e.checked).length : 0;
   const overdue = isBoard
@@ -202,7 +204,8 @@ function entryLine(entry, threadType, depth, now) {
   }
 
   const text = flattenText(entry.text);
-  parts.push(entry.subtype === "note" ? `*(note)* ${text}` : text);
+  const tags = [entry.archived && "*(archived)*", entry.subtype === "note" && "*(note)*"].filter(Boolean);
+  parts.push(tags.length ? `${tags.join(" ")} ${text}` : text);
 
   if (entry.dueDate) {
     const verdict = dueVerdict(entry.dueDate, now);
@@ -283,7 +286,7 @@ function computeStats(filtered, now) {
     const entries = Array.isArray(t.entries) ? t.entries : [];
     entryCount += entries.length;
     if (t.type === "board") {
-      openTasks += entries.filter(e => !e.checked && e.subtype !== "note").length;
+      openTasks += entries.filter(e => !e.checked && !e.archived && e.subtype !== "note").length;
     }
     for (const e of entries) {
       const diff = dayDiffFrom(e.dateISO, now);

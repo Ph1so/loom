@@ -4,7 +4,8 @@ import {
   LayoutGrid, Feather, Zap, Clock, Pin, CornerDownRight, ChevronDown,
   ChevronRight, Inbox, GripVertical, AlignLeft, List,
   AlertCircle, BookOpen, FolderOpen, Folder, Trash2, Settings, Sun, Moon,
-  Calendar, FolderInput, ArrowUp, ArrowDown, ClipboardList, FileText, Sparkles
+  Calendar, FolderInput, ArrowUp, ArrowDown, ClipboardList, FileText, Sparkles,
+  Archive, ArchiveRestore
 } from "lucide-react";
 import { buildExportMarkdown } from "./export.js";
 import { PALETTES } from "./palette.js";
@@ -537,13 +538,13 @@ export default function Loom() {
 
   const current     = threads.find(t => t.id === view);
   const inboxThread = threads.find(t => t.id === "inbox");
-  const inboxCount  = inboxThread ? inboxThread.entries.length : 0;
+  const inboxCount  = inboxThread ? inboxThread.entries.filter(e => !e.archived).length : 0;
 
   // Home red alert: overdue board tasks + forms due to be filled out.
   const overdueCount = threads
     .filter(t => t.type === "board" && t.id !== "inbox")
     .reduce((n, t) => n + t.entries.filter(e => {
-      if (e.checked || e.subtype === "note" || !e.dueDate) return false;
+      if (e.checked || e.archived || e.subtype === "note" || !e.dueDate) return false;
       const diff = dueDayDiff(e.dueDate);
       return diff !== null && diff < 0;
     }).length, 0);
@@ -738,6 +739,14 @@ export default function Loom() {
   const pinEntry = (tid, eid) => {
     setThreads(p => p.map(t => t.id === tid
       ? touchThread({ ...t, entries: t.entries.map(e => e.id === eid ? { ...e, pinned: !e.pinned } : e) }) : t));
+  };
+
+  // Archiving keeps an entry (and its data) around but out of the way — the
+  // opposite of deleteEntry, which is permanent. Toggled so the same action
+  // un-archives.
+  const archiveEntry = (tid, eid) => {
+    setThreads(p => p.map(t => t.id === tid
+      ? touchThread({ ...t, entries: t.entries.map(e => e.id === eid ? { ...e, archived: !e.archived } : e) }) : t));
   };
 
   const setDueDate = (tid, eid, dueDate) => {
@@ -948,7 +957,7 @@ export default function Loom() {
   const filtered = threads.filter(t => t.id === "inbox" || !search || t.title.toLowerCase().includes(search.toLowerCase()));
   const rootThreads = filtered.filter(t => t.id !== "inbox" && !t.parentId);
 
-  const ops = { addEntry, addEntries, updateEntry, toggleCheck, pinEntry, setDueDate, setEntryDate, deleteEntry, moveEntry, reorderEntries, renameThread, setThreadDescription, setThreadDisplayMode, setThreadSortOrder, deleteThread };
+  const ops = { addEntry, addEntries, updateEntry, toggleCheck, pinEntry, archiveEntry, setDueDate, setEntryDate, deleteEntry, moveEntry, reorderEntries, renameThread, setThreadDescription, setThreadDisplayMode, setThreadSortOrder, deleteThread };
   const selection = { selectedThreadIds, selectedEntryIds, toggleThreadSelection, toggleEntrySelection, clearSelection };
   const selectionCount = selectedThreadIds.size + selectedEntryIds.size;
 
@@ -2004,8 +2013,8 @@ function SbThreadTree({ thread, allThreads, view, go, depth, collapsed, toggleCo
   const children = getChildren(allThreads, thread.id);
   const hasKids  = children.length > 0;
   const isOpen   = !collapsed.has(thread.id);
-  const done     = thread.type === "board" ? thread.entries.filter(e => e.checked).length : null;
-  const taskTotal = thread.type === "board" ? thread.entries.filter(e => e.subtype !== "note").length : thread.entries.length;
+  const done     = thread.type === "board" ? thread.entries.filter(e => e.checked && !e.archived).length : null;
+  const taskTotal = thread.type === "board" ? thread.entries.filter(e => e.subtype !== "note" && !e.archived).length : thread.entries.filter(e => !e.archived).length;
 
   const isDraggingThis = dragState.dragging === thread.id;
   const target         = dragState.target;
@@ -2129,7 +2138,7 @@ function SbThreadTree({ thread, allThreads, view, go, depth, collapsed, toggleCo
                 ? "Move inside this thread"
                 : done !== null
                   ? `${done}/${taskTotal} done`
-                  : `${thread.entries.length} entries`}
+                  : `${taskTotal} entries`}
               {!isDropInside && hasKids && ` · ${children.length} sub`}
             </div>
           </div>
@@ -2678,7 +2687,7 @@ function SmartSurface({ threads, allThreads, go }) {
   // Overdue / due-soon board entries across ALL threads (time-sensitive → first).
   (allThreads || threads).filter(t => t.type === "board" && t.id !== "inbox").forEach(t => {
     t.entries.forEach(e => {
-      if (e.checked || e.subtype === "note" || !e.dueDate) return;
+      if (e.checked || e.archived || e.subtype === "note" || !e.dueDate) return;
       const diff = dueDayDiff(e.dueDate);
       if (diff === null || diff > 7) return; // only overdue or within a week
       items.push({ kind: "due", thread: t, entry: e, diff });
@@ -2687,14 +2696,15 @@ function SmartSurface({ threads, allThreads, go }) {
   });
   items.sort((a, b) => a.diff - b.diff); // most overdue first (only due items present here)
   threads.filter(t => t.type === "board").forEach(t => {
-    const pending = t.entries.filter(e => !e.checked && e.subtype !== "note" && !surfaced.has(e.id));
+    const pending = t.entries.filter(e => !e.checked && !e.archived && e.subtype !== "note" && !surfaced.has(e.id));
     if (pending.length > 0) {
       const pinned = pending.filter(e => e.pinned);
       items.push({ kind: "action", thread: t, pending: pending.length, topTask: (pinned[0] || pending[0]).text });
     }
   });
   threads.filter(t => t.type === "question").forEach(t => {
-    if (t.entries.length > 0) items.push({ kind: "reflection", thread: t, last: t.entries[t.entries.length - 1].text });
+    const visible = t.entries.filter(e => !e.archived);
+    if (visible.length > 0) items.push({ kind: "reflection", thread: t, last: visible[visible.length - 1].text });
   });
   if (items.length === 0) return null;
   return (
@@ -2753,7 +2763,7 @@ function overdueInSubtree(threads, thread) {
   let n = 0;
   if (thread.type === "board") {
     n += thread.entries.filter(e => {
-      if (e.checked || e.subtype === "note" || !e.dueDate) return false;
+      if (e.checked || e.archived || e.subtype === "note" || !e.dueDate) return false;
       const diff = dueDayDiff(e.dueDate);
       return diff !== null && diff < 0;
     }).length;
@@ -2765,10 +2775,11 @@ function overdueInSubtree(threads, thread) {
 function ThreadCard({ thread, threads, go, i }) {
   const cfg      = TYPES[thread.type];
   const Icon     = cfg.icon;
-  const last     = thread.entries[thread.entries.length - 1];
+  const visibleEntries = thread.entries.filter(e => !e.archived);
+  const last     = visibleEntries[visibleEntries.length - 1];
   const isBoardT = thread.type === "board";
-  const done     = isBoardT ? thread.entries.filter(e => e.checked).length : null;
-  const total    = isBoardT ? thread.entries.filter(e => e.subtype !== "note").length : thread.entries.length;
+  const done     = isBoardT ? visibleEntries.filter(e => e.checked).length : null;
+  const total    = isBoardT ? visibleEntries.filter(e => e.subtype !== "note").length : visibleEntries.length;
   const children = getChildren(threads, thread.id);
   const overdue  = overdueInSubtree(threads, thread);
   return (
@@ -2822,7 +2833,7 @@ function ThreadCard({ thread, threads, go, i }) {
 function TimelineView({ threads, go }) {
   const allEntries = [];
   threads.filter(t => t.id !== "inbox").forEach(t => {
-    t.entries.forEach(e => allEntries.push({ ...e, threadId: t.id, threadTitle: t.title, threadType: t.type }));
+    t.entries.filter(e => !e.archived).forEach(e => allEntries.push({ ...e, threadId: t.id, threadTitle: t.title, threadType: t.type }));
   });
   allEntries.sort((a, b) => entryDayDiff(a) - entryDayDiff(b));
   const groups = {};
@@ -2933,7 +2944,7 @@ function SortOrderToggle({ order, onChange, accent }) {
   );
 }
 
-function ThreadView({ thread, threads, go, setShowNew, addEntry, addEntries, updateEntry, toggleCheck, pinEntry, setDueDate, setEntryDate, deleteEntry, moveEntry, reorderEntries, renameThread, setThreadDescription, setThreadDisplayMode, setThreadSortOrder, deleteThread, selectedEntryIds, toggleEntrySelection, showDoneDefault = false, smartSortReady = false }) {
+function ThreadView({ thread, threads, go, setShowNew, addEntry, addEntries, updateEntry, toggleCheck, pinEntry, archiveEntry, setDueDate, setEntryDate, deleteEntry, moveEntry, reorderEntries, renameThread, setThreadDescription, setThreadDisplayMode, setThreadSortOrder, deleteThread, selectedEntryIds, toggleEntrySelection, showDoneDefault = false, smartSortReady = false }) {
   const cfg      = TYPES[thread.type];
   const Icon     = cfg.icon;
   const isBoard  = thread.type === "board";
@@ -2945,6 +2956,7 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, addEntries, upd
   const [entrySubtype, setEntrySubtype] = useState("entry");
   const [showBulk, setShowBulk]         = useState(false);
   const [showDone, setShowDone]         = useState(showDoneDefault);
+  const [showArchived, setShowArchived] = useState(false);
   const [dragId, setDragId]             = useState(null);
   const [dropId, setDropId]             = useState(null);
   const [dropPos, setDropPos]           = useState("before"); // "before" | "after" the dropId row
@@ -2997,8 +3009,8 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, addEntries, upd
     return sortOrder === "desc" ? asc.reverse() : asc;
   };
 
-  const done      = isBoard ? thread.entries.filter(e => e.checked).length : null;
-  const total     = isBoard ? thread.entries.filter(e => e.subtype !== "note").length : thread.entries.length;
+  const done      = isBoard ? thread.entries.filter(e => e.checked && !e.archived).length : null;
+  const total     = isBoard ? thread.entries.filter(e => e.subtype !== "note" && !e.archived).length : thread.entries.filter(e => !e.archived).length;
   const children  = getChildren(threads, thread.id);
   const ancestors = buildAncestors(threads, thread.id);
   const otherThreads = threads.filter(t => t.id !== thread.id);
@@ -3070,7 +3082,7 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, addEntries, upd
     capture:  "Capture a note or idea...",
   }[thread.type];
 
-  let activeEntries = thread.entries.filter(e => !e.parentEntryId);
+  let activeEntries = thread.entries.filter(e => !e.parentEntryId && !e.archived);
   let doneEntries   = [];
   if (isBoard) {
     const live = activeEntries.filter(e => !e.checked);
@@ -3086,18 +3098,22 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, addEntries, upd
       const unpinned = live.filter(e => !e.pinned);
       activeEntries  = [...pinned, ...unpinned];
     }
-    doneEntries = sortBy(thread.entries.filter(e => e.checked && !e.parentEntryId), "dateISO");
+    doneEntries = sortBy(thread.entries.filter(e => e.checked && !e.parentEntryId && !e.archived), "dateISO");
   } else {
     activeEntries = sortBy(activeEntries, "dateISO");
   }
+  // Archived entries (top-level only — an archived reply stays nested under its
+  // parent and is revealed there when "showArchived" is on) are kept out of the
+  // way by default, unlike deleteEntry which is permanent.
+  const archivedEntries = sortBy(thread.entries.filter(e => e.archived && !e.parentEntryId), "dateISO");
 
   const sharedEntryProps = {
     type: thread.type, cfg, threadId: thread.id,
-    toggleCheck, pinEntry, setDueDate, setEntryDate, deleteEntry, updateEntry,
+    toggleCheck, pinEntry, archiveEntry, setDueDate, setEntryDate, deleteEntry, updateEntry,
     editingId, setEditingId,
     onReply: (entry) => { setReplyingTo(entry); setTimeout(() => taRef.current?.focus(), 0); },
     isBoard, isInbox, otherThreads, allThreads: threads, moveEntry,
-    childrenOf, layout: displayMode,
+    childrenOf, layout: displayMode, showArchived,
     selectedEntryIds, toggleEntrySelection,
     smartSortReady,
   };
@@ -3236,7 +3252,7 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, addEntries, upd
         {(children.length > 0 || !isInbox) && (
           <SubThreadSection children={children} parentThread={thread} go={go} setShowNew={setShowNew} />
         )}
-        {thread.entries.length === 0 && children.length === 0 && (
+        {activeEntries.length === 0 && doneEntries.length === 0 && archivedEntries.length === 0 && children.length === 0 && (
           <div style={{ textAlign: "center", padding: "48px 0", color: C.text3, fontSize: 14 }}>
             {isInbox ? "Your inbox is clear." : "No entries yet. Add the first one below."}
           </div>
@@ -3293,6 +3309,22 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, addEntries, upd
             {showDone && (
               <div style={{ opacity: 0.6, ...listContainerStyle }}>
                 {doneEntries.map((e, i) => (
+                  <EntryTreeNode key={e.id} entry={e} i={i} depth={0} canDrag={false} dragId={null} dropId={null} onDragStartId={() => {}} onDragOverId={() => {}} onDropId={() => {}} onDragEnd={() => {}} {...sharedEntryProps} />
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {archivedEntries.length > 0 && (
+          <div style={{ marginTop: 24 }}>
+            <button onClick={() => setShowArchived(a => !a)} className="ghost" style={{ display: "flex", alignItems: "center", gap: 7, background: "transparent", border: "none", color: C.text3, fontSize: 12, cursor: "pointer", padding: "6px 8px", borderRadius: 7, marginBottom: 8 }}>
+              {showArchived ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+              <Archive size={12} /> {archivedEntries.length} archived
+            </button>
+            {showArchived && (
+              <div style={{ opacity: 0.6, ...listContainerStyle }}>
+                {archivedEntries.map((e, i) => (
                   <EntryTreeNode key={e.id} entry={e} i={i} depth={0} canDrag={false} dragId={null} dropId={null} onDragStartId={() => {}} onDragOverId={() => {}} onDropId={() => {}} onDragEnd={() => {}} {...sharedEntryProps} />
                 ))}
               </div>
@@ -3408,8 +3440,8 @@ function SubThreadSection({ children, parentThread, go, setShowNew }) {
         {children.map((child, i) => {
           const cfg  = TYPES[child.type];
           const Icon = cfg.icon;
-          const done = child.type === "board" ? child.entries.filter(e => e.checked).length : null;
-          const childTotal = child.type === "board" ? child.entries.filter(e => e.subtype !== "note").length : child.entries.length;
+          const done = child.type === "board" ? child.entries.filter(e => e.checked && !e.archived).length : null;
+          const childTotal = child.type === "board" ? child.entries.filter(e => e.subtype !== "note" && !e.archived).length : child.entries.filter(e => !e.archived).length;
           return (
             <div key={child.id} className="sub-card" onClick={() => go(child.id)} style={{ background: C.surf2, border: `1px solid ${C.border}`, borderRadius: 12, padding: "16px 18px", animation: `fadeUp 0.22s ${Math.min(i, 5) * 0.02}s ease both` }}>
               <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 10 }}>
@@ -3438,8 +3470,8 @@ function SubThreadSection({ children, parentThread, go, setShowNew }) {
 }
 
 // ─── ENTRY TREE NODE (recursive) ───
-function EntryTreeNode({ entry, depth, i, childrenOf, layout = "list", canDrag, dragId, dropId, dropPos, onDragStartId, onDragOverId, onDropId, onDragEnd, ...rowProps }) {
-  const replies = childrenOf[entry.id] || [];
+function EntryTreeNode({ entry, depth, i, childrenOf, layout = "list", canDrag, dragId, dropId, dropPos, onDragStartId, onDragOverId, onDropId, onDragEnd, showArchived, ...rowProps }) {
+  const replies = (childrenOf[entry.id] || []).filter(r => showArchived || !r.archived);
   const lineColor = rowProps.cfg.color;
   const [collapsed, setCollapsed] = useState(false);
   const dragProps = {
@@ -3472,7 +3504,7 @@ function EntryTreeNode({ entry, depth, i, childrenOf, layout = "list", canDrag, 
               {replies.map((r, ri) => (
                 <EntryTreeNode
                   key={r.id} entry={r} depth={depth + 1} i={ri}
-                  childrenOf={childrenOf} layout={layout}
+                  childrenOf={childrenOf} layout={layout} showArchived={showArchived}
                   {...dragProps}
                   {...rowProps}
                 />
@@ -3524,7 +3556,7 @@ function SortSuggestion({ suggestion, threads, onAccept, onReject, onDismiss }) 
 }
 
 // ─── ENTRY ROW ───
-function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, setDueDate, setEntryDate, deleteEntry, updateEntry, editingId, setEditingId, onReply, isBoard, isInbox, otherThreads, allThreads = [], moveEntry, layout = "list", draggable: isDraggable, dragId, dropId, dropPos, onDragStart, onDragOver, onDrop, onDragEnd, i, selectedEntryIds, toggleEntrySelection, smartSortReady = false }) {
+function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, archiveEntry, setDueDate, setEntryDate, deleteEntry, updateEntry, editingId, setEditingId, onReply, isBoard, isInbox, otherThreads, allThreads = [], moveEntry, layout = "list", draggable: isDraggable, dragId, dropId, dropPos, onDragStart, onDragOver, onDrop, onDragEnd, i, selectedEntryIds, toggleEntrySelection, smartSortReady = false }) {
   const [editText, setEditText] = useState(entry.text);
   const [moveOpen, setMoveOpen] = useState(false);
   const [sortState, setSortState] = useState(null); // null | {status:"loading"} | {status:"error",msg} | {status:"done",suggestion}
@@ -3651,12 +3683,13 @@ function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, setDueDat
           <div>
             <textarea ref={editRef} value={editText} onChange={e => setEditText(e.target.value)}
               onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); saveEdit(); } if (e.key === "Escape") cancelEdit(); }}
+              onBlur={saveEdit}
               style={{ width: "100%", background: C.surf2, border: `1px solid ${cfg.color}44`, borderRadius: 8, color: C.text, fontSize: 13.5, padding: "10px 12px", resize: "none", lineHeight: 1.65, fontWeight: 300, fontFamily: "'DM Sans', sans-serif" }}
               rows={3}
             />
             <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
               <button onClick={saveEdit} style={{ fontSize: 11.5, color: cfg.color, background: cfg.bg, border: `1px solid ${cfg.border}`, borderRadius: 6, padding: "4px 12px", cursor: "pointer", fontFamily: "'DM Sans', sans-serif" }}>Save</button>
-              <button onClick={cancelEdit} style={{ fontSize: 11.5, color: C.text3, background: "transparent", border: "none", cursor: "pointer", fontFamily: "'DM Sans', sans-serif" }}>Cancel</button>
+              <button onMouseDown={e => e.preventDefault()} onClick={cancelEdit} style={{ fontSize: 11.5, color: C.text3, background: "transparent", border: "none", cursor: "pointer", fontFamily: "'DM Sans', sans-serif" }}>Cancel</button>
             </div>
           </div>
         ) : (
@@ -3681,6 +3714,7 @@ function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, setDueDat
                 />
               </span>
               {isNote && <span style={{ fontSize: 10, color: C.text3, background: C.overlay, padding: "1px 7px", borderRadius: 4 }}>note</span>}
+              {entry.archived && <span style={{ fontSize: 10, color: C.text3, background: C.overlay, padding: "1px 7px", borderRadius: 4, display: "inline-flex", alignItems: "center", gap: 4 }}><Archive size={9} /> archived</span>}
               {entry.pinned && <span style={{ fontSize: 10, color: C.gold, display: "flex", alignItems: "center", gap: 3 }}><Pin size={9} /> pinned</span>}
               {entry.dueDate && (
                 <span
@@ -3783,6 +3817,9 @@ function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, setDueDat
               <FolderInput size={12} color={moveOpen ? C.gold : C.text3} />
             </button>
           )}
+          <button className="ghost" onClick={() => archiveEntry(threadId, entry.id)} title={entry.archived ? "Unarchive" : "Archive"} style={{ background: "transparent", border: "none", cursor: "pointer", padding: 5, borderRadius: 5, display: "flex" }}>
+            {entry.archived ? <ArchiveRestore size={12} color={C.gold} /> : <Archive size={12} color={C.text3} />}
+          </button>
           <button className="ghost" onClick={() => { loomConfirm({ title: "Delete entry?", message: "Delete this entry? This can't be undone." }).then(ok => { if (ok) deleteEntry(threadId, entry.id); }); }} style={{ background: "transparent", border: "none", cursor: "pointer", padding: 5, borderRadius: 5, display: "flex" }}>
             <X size={12} color={C.text3} />
           </button>

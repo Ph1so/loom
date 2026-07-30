@@ -144,6 +144,7 @@ interface Entry {
   pinned?: boolean;             // board only
   dueDate?: string;             // board only, "YYYY-MM-DD"
   parentEntryId?: string;       // one-level reply threading within a thread
+  archived?: boolean;           // hidden from active views, kept (not deleted); any type
 }
 
 interface Prefs {              // DEFAULT_PREFS in App.jsx
@@ -161,6 +162,12 @@ interface Prefs {              // DEFAULT_PREFS in App.jsx
   has its own copy of `localISO` — keep them in sync.
 - Reply threading is **one level**. Replies-to-replies aren't supported by the renderer.
 - Entry order is array order. Reordering is array manipulation, not a sort-key change.
+- `archived` is the non-destructive alternative to deleting an entry: `archiveEntry(tid, eid)`
+  toggles it. Archived entries are filtered out of ThreadView's active list, board done/total
+  counts, Timeline, Inbox's unread badge, and `SmartSurface`'s "Needs Attention" surfacing — but
+  stay in `thread.entries` and are still exported (tagged `*(archived)*` in markdown). Each
+  ThreadView has a per-thread "Show archived" toggle (mirrors the board "completed" toggle) to
+  reveal them, dimmed, with an Unarchive action.
 
 ## UI structure ([src/App.jsx](loom-desktop/src/App.jsx))
 
