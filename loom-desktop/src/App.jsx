@@ -112,15 +112,30 @@ const G = `
   /* Cards/panels are pinned to a fixed 85% opacity -- NOT driven by --g-*
      vars. Only the sidebar and main background move with the Glass
      intensity slider now. */
-  .glass .t-card, .glass .attn-card, .glass .sub-card, .glass .lm-panel {
+  .glass .t-card, .glass .sub-card, .glass .lm-panel {
     background: rgba(28,26,21,0.85) !important;
     border-color: rgba(255,255,255,0.05) !important;
     backdrop-filter: blur(14px) saturate(180%);
     -webkit-backdrop-filter: blur(14px) saturate(180%);
     box-shadow: inset 0 1px 0 rgba(255,255,255,0.03), 0 8px 24px rgba(0,0,0,0.28);
   }
-  .glass .t-card:hover, .glass .attn-card:hover, .glass .sub-card:hover {
+  .glass .t-card:hover, .glass .sub-card:hover {
     background: rgba(32,30,24,0.95) !important;
+  }
+  /* .attn-card rows always live *inside* a .lm-panel (Pinned Tasks, Needs
+     Attention, Upcoming, Recently Active) -- giving them the same opaque
+     fill + blur + big card shadow as their parent stacked two identical
+     translucent layers directly on top of each other, which read as a
+     visible seam/box around each small row. These get no fill of their own
+     (just barely there, sitting flat on the panel behind them) and no
+     shadow -- only the hover state gets a light tint. */
+  .glass .attn-card {
+    background: rgba(255,255,255,0.03) !important;
+    border-color: rgba(255,255,255,0.06) !important;
+    box-shadow: none !important;
+  }
+  .glass .attn-card:hover {
+    background: rgba(255,255,255,0.07) !important;
   }
 
   .theme-light.app-shell.glass {
@@ -136,13 +151,21 @@ const G = `
     border-right-color: rgba(0,0,0,var(--g-border)) !important;
     box-shadow: inset -1px 0 0 rgba(255,255,255,0.6);
   }
-  .theme-light.glass .t-card, .theme-light.glass .attn-card, .theme-light.glass .sub-card, .theme-light.glass .lm-panel {
+  .theme-light.glass .t-card, .theme-light.glass .sub-card, .theme-light.glass .lm-panel {
     background: rgba(250,246,236,0.85) !important;
     border-color: rgba(0,0,0,0.05) !important;
     box-shadow: inset 0 1px 0 rgba(255,255,255,0.7), 0 8px 24px rgba(0,0,0,0.08);
   }
-  .theme-light.glass .t-card:hover, .theme-light.glass .attn-card:hover, .theme-light.glass .sub-card:hover {
+  .theme-light.glass .t-card:hover, .theme-light.glass .sub-card:hover {
     background: rgba(250,246,236,0.95) !important;
+  }
+  .theme-light.glass .attn-card {
+    background: rgba(0,0,0,0.025) !important;
+    border-color: rgba(0,0,0,0.06) !important;
+    box-shadow: none !important;
+  }
+  .theme-light.glass .attn-card:hover {
+    background: rgba(0,0,0,0.05) !important;
   }
 `;
 
@@ -2223,9 +2246,9 @@ function SbThreadTree({ thread, allThreads, view, go, depth, collapsed, toggleCo
     }
     clearSelection?.();
     go(thread.id);
-    // Reveal sub-threads on open. Only ever expand here — collapsing stays the
-    // arrow's job, so clicking an already-open thread doesn't fold it shut.
-    if (hasKids && !isOpen) toggleCollapse(thread.id);
+    // Clicking a thread with sub-threads toggles its expansion, same as the
+    // chevron: closed -> open, already-open -> collapse.
+    if (hasKids) toggleCollapse(thread.id);
   };
 
   const handleDragStart = (e) => {
