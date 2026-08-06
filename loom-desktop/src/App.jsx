@@ -1,4 +1,5 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useLayoutEffect } from "react";
+import { createPortal } from "react-dom";
 import {
   Plus, Search, Check, ArrowLeft, X, MessageCircle, TrendingUp,
   LayoutGrid, Feather, Zap, Clock, Pin, CornerDownRight, ChevronDown,
@@ -80,6 +81,69 @@ const G = `
   .density-compact .s-item        { padding-top: 5px !important; padding-bottom: 5px !important; }
   .density-compact .sb-title-row  { font-size: 12px !important; }
   .density-compact .sb-meta-row   { display: none !important; }
+
+  /* ── Glass look: frosted, translucent sidebar + main-area panels over a
+     tinted, grained canvas. Popups (modals) and the floating selection bar
+     stay solid on purpose -- they hold text you're actively reading/editing,
+     and only the sidebar/main content is meant to read as glass.
+     The sidebar/cards don't overlap anything (they sit side-by-side, not
+     stacked), so backdrop-filter has nothing but the canvas behind them to
+     blur. A smooth gradient blurred still looks smooth -- so the canvas
+     carries a faint tiled noise layer purely to give the blur real grain to
+     visibly soften; that's what actually reads as "frosted" here.
+     Alpha/blur amounts read from --g-* custom properties (set inline on
+     .app-shell from prefs.glassIntensity) so the Settings slider can dial
+     the whole look up or down without touching this stylesheet. */
+  .app-shell.glass {
+    background:
+      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.06'/%3E%3C/svg%3E") repeat 0 0 / 180px 180px,
+      radial-gradient(1100px 760px at 12% -8%, rgba(200,165,100,var(--g-blob1)), transparent 60%),
+      radial-gradient(900px 680px at 100% 105%, rgba(106,157,192,var(--g-blob2)), transparent 55%),
+      radial-gradient(700px 520px at 55% 45%, rgba(158,132,191,var(--g-blob3)), transparent 55%),
+      rgba(11,10,8,var(--g-canvas)) !important;
+  }
+  .glass .lm-sidebar {
+    background: rgba(14,13,10,var(--g-sidebar)) !important;
+    border-right-color: rgba(255,255,255,var(--g-border)) !important;
+    backdrop-filter: blur(var(--g-blur-sidebar)) saturate(200%);
+    -webkit-backdrop-filter: blur(var(--g-blur-sidebar)) saturate(200%);
+    box-shadow: inset -1px 0 0 rgba(255,255,255, calc(var(--g-border) * 0.6));
+  }
+  /* Cards/panels are pinned to a fixed 85% opacity -- NOT driven by --g-*
+     vars. Only the sidebar and main background move with the Glass
+     intensity slider now. */
+  .glass .t-card, .glass .attn-card, .glass .sub-card, .glass .lm-panel {
+    background: rgba(28,26,21,0.85) !important;
+    border-color: rgba(255,255,255,0.05) !important;
+    backdrop-filter: blur(14px) saturate(180%);
+    -webkit-backdrop-filter: blur(14px) saturate(180%);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.03), 0 8px 24px rgba(0,0,0,0.28);
+  }
+  .glass .t-card:hover, .glass .attn-card:hover, .glass .sub-card:hover {
+    background: rgba(32,30,24,0.95) !important;
+  }
+
+  .theme-light.app-shell.glass {
+    background:
+      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.05'/%3E%3C/svg%3E") repeat 0 0 / 180px 180px,
+      radial-gradient(1100px 760px at 12% -8%, rgba(156,126,64,var(--g-blob1)), transparent 60%),
+      radial-gradient(900px 680px at 100% 105%, rgba(106,157,192,var(--g-blob2)), transparent 55%),
+      radial-gradient(700px 520px at 55% 45%, rgba(158,132,191,var(--g-blob3)), transparent 55%),
+      rgba(253,250,243,var(--g-canvas)) !important;
+  }
+  .theme-light.glass .lm-sidebar {
+    background: rgba(245,239,226,var(--g-sidebar)) !important;
+    border-right-color: rgba(0,0,0,var(--g-border)) !important;
+    box-shadow: inset -1px 0 0 rgba(255,255,255,0.6);
+  }
+  .theme-light.glass .t-card, .theme-light.glass .attn-card, .theme-light.glass .sub-card, .theme-light.glass .lm-panel {
+    background: rgba(250,246,236,0.85) !important;
+    border-color: rgba(0,0,0,0.05) !important;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.7), 0 8px 24px rgba(0,0,0,0.08);
+  }
+  .theme-light.glass .t-card:hover, .theme-light.glass .attn-card:hover, .theme-light.glass .sub-card:hover {
+    background: rgba(250,246,236,0.95) !important;
+  }
 `;
 
 // `C` is read by every component during render. We reassign it at the top of
@@ -431,7 +495,46 @@ const DEFAULT_PREFS = {
   density: "comfortable",      // "comfortable" | "compact"
   startupView: "home",         // "home" | "timeline" | "inbox" | "last"
   showDoneByDefault: false,    // initial value of ThreadView's showDone
+  glass: false,                // frosted/translucent panel look (sidebar, cards, modals)
+  glassIntensity: 60,          // 0 (barely translucent) – 100 (maximally see-through); drives --g-* CSS vars
+  vibrancy: false,             // real OS-level window translucency (macOS); only takes effect when `glass` is also on
 };
+
+// Turns the "Glass intensity" slider (0-100) into the --g-* custom properties
+// the `.glass` CSS rules read from -- see the "Glass look" block in `G`.
+// Higher intensity = lower panel alpha (more see-through) + more blur.
+function glassCssVars(intensity) {
+  const t = Math.max(0, Math.min(100, intensity)) / 100;
+  const lerp = (a, b) => a + (b - a) * t;
+  // Two-segment ramp for sidebar/canvas opacity: 0%-50% goes from a new,
+  // near-opaque ceiling down to what used to be the 0% look, then 50%-100%
+  // replays what the old 0%-100% range covered, fading on to fully
+  // transparent. So "what was 0%" now sits at the 50% mark, with real room
+  // above it for a barely-tinted, mostly-solid option.
+  const ramp = (hi, mid, lo) => t <= 0.5 ? hi + (mid - hi) * (t / 0.5) : mid + (lo - mid) * ((t - 0.5) / 0.5);
+  return {
+    // Sidebar + main background (regions "1" and "2") are the only things
+    // the slider drives now -- panels/cards ("3") are pinned to a fixed
+    // look (see the .glass .t-card rule in `G`) and don't move with it.
+    "--g-sidebar": ramp(0.85, 0.5, 0).toFixed(2),
+    "--g-canvas": ramp(0.85, 0.156, 0).toFixed(2),
+    "--g-border": lerp(0.08, 0.35).toFixed(2),
+    // Blobs fade out with intensity too now (they used to grow stronger),
+    // since the canvas fading toward transparent already does the "more
+    // see-through" work -- letting the color blobs also grow used to read
+    // as a muddy smear in the sidebar's top corner once the base fill
+    // wasn't there to dilute it anymore.
+    "--g-blob1": lerp(0.14, 0.02).toFixed(2),
+    "--g-blob2": lerp(0.09, 0.02).toFixed(2),
+    "--g-blob3": lerp(0.06, 0.01).toFixed(2),
+    // Blur runs *backwards* from opacity: low intensity = a hazier, more
+    // opaque sidebar; high intensity = fill fades toward 0 AND blur fades
+    // toward 0 together, so 100% reads as clear glass -- you can actually
+    // read text behind it (with Translucent window also on), not just a
+    // fainter fog.
+    "--g-blur-sidebar": `${lerp(16, 1).toFixed(1)}px`,
+  };
+}
 
 // Models offered for Smart Sort (must match the ids main.js/electron/llm.js accept).
 const MODEL_OPTS = [
@@ -501,6 +604,17 @@ export default function Loom() {
   useEffect(() => {
     try { localStorage.setItem("loom-prefs", JSON.stringify(prefs)); } catch {}
   }, [prefs]);
+
+  // index.html hardcodes an opaque body background (`#0B0A08`) to avoid a
+  // white flash before the theme loads. That opaque body sits behind the
+  // whole page, so with a real translucent window it blocks the OS vibrancy
+  // everywhere except where `backdrop-filter` explicitly reaches past it —
+  // which is why only backdrop-filtered panels (the sidebar) showed the
+  // desktop through, while plain areas stayed solid black. Correct it here,
+  // once real prefs are known, to the authoritative source of truth.
+  useEffect(() => {
+    document.body.style.background = (prefs.glass && prefs.vibrancy) ? "transparent" : C.bg;
+  }, [theme, prefs.glass, prefs.vibrancy]);
 
   useEffect(() => {
     try { localStorage.setItem("loom-last-view", view); } catch {}
@@ -988,7 +1102,7 @@ export default function Loom() {
   return (
     <>
       <style dangerouslySetInnerHTML={{ __html: G }} />
-      <div className={`theme-${theme} density-${prefs.density}`} style={{ display: "flex", height: "100vh", background: C.bg, fontFamily: "'DM Sans', sans-serif", color: C.text, overflow: "hidden" }}>
+      <div className={`theme-${theme} density-${prefs.density} app-shell${prefs.glass ? " glass" : ""}`} style={{ display: "flex", height: "100vh", background: C.bg, fontFamily: "'DM Sans', sans-serif", color: C.text, overflow: "hidden", ...(prefs.glass ? glassCssVars(prefs.glassIntensity) : null) }}>
         <Sidebar
           threads={threads} filtered={filtered} rootThreads={rootThreads}
           view={view} go={go} search={search} setSearch={setSearch}
@@ -1098,6 +1212,7 @@ function SelectionBar({ threadCount, entryCount, threads = [], onMoveEntries, on
   return (
     <>
     <div
+      className="lm-float"
       style={{
         position: "fixed", left: "50%", bottom: 24, transform: "translateX(-50%)",
         background: C.surf2, border: `1px solid ${C.border}`, borderRadius: 12,
@@ -1206,18 +1321,20 @@ function SegSelect({ value, onChange, options }) {
   );
 }
 
-function ToggleSwitch({ checked, onChange }) {
+function ToggleSwitch({ checked, onChange, disabled = false }) {
   return (
     <button
-      onClick={() => onChange(!checked)}
+      onClick={() => !disabled && onChange(!checked)}
       role="switch"
       aria-checked={checked}
+      disabled={disabled}
       style={{
         width: 36, height: 20, borderRadius: 999,
         background: checked ? C.gold : C.overlayHi,
         border: `1px solid ${checked ? C.goldBorder : C.border}`,
-        position: "relative", cursor: "pointer", padding: 0,
-        transition: "background 0.16s, border-color 0.16s",
+        position: "relative", cursor: disabled ? "not-allowed" : "pointer", padding: 0,
+        opacity: disabled ? 0.4 : 1,
+        transition: "background 0.16s, border-color 0.16s, opacity 0.16s",
       }}
     >
       <span style={{
@@ -1336,6 +1453,7 @@ function MoveToThreadModal({ threads, excludeId = null, title = "Move to thread"
       style={{ position: "fixed", inset: 0, background: C.scrim, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 320, animation: "fadeIn 0.18s ease both", backdropFilter: "blur(6px)" }}
     >
       <div
+        className="lm-modal"
         onClick={e => e.stopPropagation()}
         style={{ width: 460, maxWidth: "92vw", maxHeight: "80vh", display: "flex", flexDirection: "column", background: C.surf, border: `1px solid ${C.border}`, borderRadius: 14, animation: "slideIn 0.22s ease both", boxShadow: "0 24px 60px rgba(0,0,0,0.5)" }}
       >
@@ -1472,6 +1590,7 @@ function ExportPickerModal({ threads, onClose }) {
       style={{ position: "fixed", inset: 0, background: C.scrim, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 260, animation: "fadeIn 0.18s ease both", backdropFilter: "blur(6px)" }}
     >
       <div
+        className="lm-modal"
         onClick={e => e.stopPropagation()}
         style={{ width: 540, maxWidth: "92vw", maxHeight: "86vh", display: "flex", flexDirection: "column", background: C.surf, border: `1px solid ${C.border}`, borderRadius: 14, animation: "slideIn 0.22s ease both", boxShadow: "0 24px 60px rgba(0,0,0,0.5)" }}
       >
@@ -1622,6 +1741,7 @@ function SettingsModal({ theme, setTheme, prefs, setPrefs, threads, onClose }) {
       style={{ position: "fixed", inset: 0, background: C.scrim, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 250, animation: "fadeIn 0.18s ease both", backdropFilter: "blur(6px)" }}
     >
       <div
+        className="lm-modal"
         onClick={e => e.stopPropagation()}
         style={{ width: 500, maxWidth: "92vw", maxHeight: "86vh", overflowY: "auto", background: C.surf, border: `1px solid ${C.border}`, borderRadius: 14, padding: "22px 24px 18px", animation: "slideIn 0.22s ease both", boxShadow: "0 24px 60px rgba(0,0,0,0.5)" }}
       >
@@ -1652,6 +1772,46 @@ function SettingsModal({ theme, setTheme, prefs, setPrefs, threads, onClose }) {
                 { value: "comfortable", label: "Comfortable" },
                 { value: "compact",     label: "Compact"     },
               ]}
+            />
+          </SettingsRow>
+
+          <SettingsRow label="Glass look" hint="Frosted, translucent sidebar, cards, and modals">
+            <ToggleSwitch
+              checked={prefs.glass}
+              onChange={(v) => {
+                setPref("glass", v);
+                if (!v && prefs.vibrancy) {
+                  setPref("vibrancy", false);
+                  window.loomAPI?.setWindowVibrancy?.(false);
+                }
+              }}
+            />
+          </SettingsRow>
+
+          <SettingsRow label="Glass intensity" hint="How see-through the frosted panels are">
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <input
+                type="range"
+                min={0}
+                max={100}
+                step={5}
+                value={prefs.glassIntensity}
+                disabled={!prefs.glass}
+                onChange={(e) => setPref("glassIntensity", Number(e.target.value))}
+                style={{ width: 130, accentColor: C.gold, opacity: prefs.glass ? 1 : 0.4, cursor: prefs.glass ? "pointer" : "not-allowed" }}
+              />
+              <span style={{ fontSize: 11.5, color: C.text3, width: 30, textAlign: "right" }}>{prefs.glassIntensity}%</span>
+            </div>
+          </SettingsRow>
+
+          <SettingsRow label="Translucent window" hint="Let whatever's behind Loom show through, crisply -- not the frosted blur macOS apps like Notes use. Requires Glass look, and briefly reloads the window when toggled.">
+            <ToggleSwitch
+              checked={prefs.glass && prefs.vibrancy}
+              disabled={!prefs.glass}
+              onChange={(v) => {
+                setPref("vibrancy", v);
+                window.loomAPI?.setWindowVibrancy?.(v);
+              }}
             />
           </SettingsRow>
         </SettingsSection>
@@ -1870,6 +2030,7 @@ function ReviewModal({ threads, onApply, onClose, state, setState }) {
       style={{ position: "fixed", inset: 0, background: C.scrim, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 320, animation: "fadeIn 0.18s ease both", backdropFilter: "blur(6px)" }}
     >
       <div
+        className="lm-modal"
         onClick={e => e.stopPropagation()}
         style={{ width: 560, maxWidth: "92vw", maxHeight: "82vh", display: "flex", flexDirection: "column", background: C.surf, border: `1px solid ${C.border}`, borderRadius: 14, animation: "slideIn 0.22s ease both", boxShadow: "0 24px 60px rgba(0,0,0,0.5)" }}
       >
@@ -1956,7 +2117,7 @@ function Sidebar({ threads, filtered, rootThreads, view, go, search, setSearch, 
   const isRootTarget  = dragState.target?.position === "root";
 
   return (
-    <div style={{ width: 256, minWidth: 256, background: C.sb, borderRight: `1px solid ${C.border}`, display: "flex", flexDirection: "column", height: "100vh", overflow: "hidden" }}>
+    <div className="lm-sidebar" style={{ width: 256, minWidth: 256, background: C.sb, borderRight: `1px solid ${C.border}`, display: "flex", flexDirection: "column", height: "100vh", overflow: "hidden" }}>
       <div style={{ padding: "56px 22px 18px", flexShrink: 0, WebkitAppRegion: "drag" }}>
         <div style={{ fontFamily: "'Cormorant', serif", fontSize: 24, fontWeight: 400, letterSpacing: "0.01em", WebkitAppRegion: "no-drag" }}>Loom</div>
         <div style={{ fontSize: 10.5, color: C.text3, marginTop: 2, letterSpacing: "0.07em", textTransform: "uppercase", fontWeight: 500, WebkitAppRegion: "no-drag" }}>Your threads</div>
@@ -2285,7 +2446,7 @@ function HomeView({ threads, rootThreads, go, setShowNew, addEntry, toggleCheck,
 // fixed; children fill the rest of the box as a flex column.
 function HomePanel({ title, accessory, children, style }) {
   return (
-    <div style={{ background: C.surf, border: `1px solid ${C.border}`, borderRadius: 16, padding: "22px 26px", display: "flex", flexDirection: "column", ...style }}>
+    <div className="lm-panel" style={{ background: C.surf, border: `1px solid ${C.border}`, borderRadius: 16, padding: "22px 26px", display: "flex", flexDirection: "column", ...style }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 14, flexShrink: 0 }}>
         <div style={{ fontSize: 11, color: C.text3, letterSpacing: "0.07em", textTransform: "uppercase", fontWeight: 500 }}>{title}</div>
         {accessory}
@@ -2318,7 +2479,7 @@ function FormsDue({ forms, threads, onFill, onSkip }) {
   return (
     <div style={{ animation: "fadeUp 0.45s 0.02s ease both", marginBottom: 28, display: "flex", flexDirection: "column", gap: 8 }}>
       {due.map(f => (
-        <div key={f.id} style={{ display: "flex", alignItems: "center", gap: 14, background: C.surf, border: `1px solid ${C.gold}`, borderRadius: 12, padding: "16px 18px" }}>
+        <div key={f.id} className="lm-panel" style={{ display: "flex", alignItems: "center", gap: 14, background: C.surf, border: `1px solid ${C.gold}`, borderRadius: 12, padding: "16px 18px" }}>
           <div style={{ width: 34, height: 34, borderRadius: 8, background: C.goldDim, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
             <ClipboardList size={15} color={C.gold} />
           </div>
@@ -2387,7 +2548,7 @@ function FormsView({ forms, threads, onNew, onEdit, onFill, onDelete }) {
             const due = formIsDue(f, new Date());
             const target = threadName(f.defaultThreadId);
             return (
-              <div key={f.id} style={{ background: C.surf, border: `1px solid ${due ? C.gold : C.border}`, borderRadius: 14, padding: "18px 22px", animation: `fadeUp 0.24s ${Math.min(i, 6) * 0.02}s ease both` }}>
+              <div key={f.id} className="lm-panel" style={{ background: C.surf, border: `1px solid ${due ? C.gold : C.border}`, borderRadius: 14, padding: "18px 22px", animation: `fadeUp 0.24s ${Math.min(i, 6) * 0.02}s ease both` }}>
                 <div style={{ display: "flex", alignItems: "flex-start", gap: 14 }}>
                   <div style={{ width: 36, height: 36, borderRadius: 9, background: C.goldDim, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
                     <ClipboardList size={16} color={C.gold} />
@@ -2461,7 +2622,7 @@ function FormFill({ form, threads, onSubmit, onClose }) {
 
   return (
     <div onClick={e => { e.stopPropagation(); onClose(); }} style={{ position: "fixed", inset: 0, background: C.scrim, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 250, animation: "fadeIn 0.18s ease both", backdropFilter: "blur(6px)" }}>
-      <div onClick={e => e.stopPropagation()} style={{ width: 520, maxWidth: "92vw", maxHeight: "86vh", display: "flex", flexDirection: "column", background: C.surf, border: `1px solid ${C.border}`, borderRadius: 14, animation: "slideIn 0.22s ease both", boxShadow: "0 24px 60px rgba(0,0,0,0.5)" }}>
+      <div className="lm-modal" onClick={e => e.stopPropagation()} style={{ width: 520, maxWidth: "92vw", maxHeight: "86vh", display: "flex", flexDirection: "column", background: C.surf, border: `1px solid ${C.border}`, borderRadius: 14, animation: "slideIn 0.22s ease both", boxShadow: "0 24px 60px rgba(0,0,0,0.5)" }}>
         <div style={{ padding: "22px 24px 14px", borderBottom: `1px solid ${C.border}`, flexShrink: 0 }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
             <div style={{ fontFamily: "'Cormorant', serif", fontSize: 23, fontWeight: 400 }}>{form.title || "Untitled form"}</div>
@@ -2593,7 +2754,7 @@ function FormEditor({ form, threads, onSave, onClose }) {
 
   return (
     <div onClick={e => { e.stopPropagation(); onClose(); }} style={{ position: "fixed", inset: 0, background: C.scrim, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 250, animation: "fadeIn 0.18s ease both", backdropFilter: "blur(6px)" }}>
-      <div onClick={e => e.stopPropagation()} style={{ width: 600, maxWidth: "94vw", maxHeight: "90vh", display: "flex", flexDirection: "column", background: C.surf, border: `1px solid ${C.border}`, borderRadius: 14, animation: "slideIn 0.22s ease both", boxShadow: "0 24px 60px rgba(0,0,0,0.5)" }}>
+      <div className="lm-modal" onClick={e => e.stopPropagation()} style={{ width: 600, maxWidth: "94vw", maxHeight: "90vh", display: "flex", flexDirection: "column", background: C.surf, border: `1px solid ${C.border}`, borderRadius: 14, animation: "slideIn 0.22s ease both", boxShadow: "0 24px 60px rgba(0,0,0,0.5)" }}>
         <div style={{ padding: "20px 24px 14px", borderBottom: `1px solid ${C.border}`, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
           <div style={{ fontFamily: "'Cormorant', serif", fontSize: 23, fontWeight: 400 }}>{form ? "Edit form" : "New form"}</div>
           <button onClick={onClose} className="ghost" style={{ background: "transparent", border: "none", cursor: "pointer", color: C.text3, padding: 6, borderRadius: 6, display: "flex" }}><X size={15} /></button>
@@ -3067,39 +3228,104 @@ const MONTH_LABELS   = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", 
 // Month labels run along the top (one per column where a new month starts);
 // weekday labels run down the left so each row is identifiable at a glance.
 function ActivityHeatmap({ threads, style }) {
-  const WEEKS = 12, CELL = 12, GAP = 3;
+  const GAP = 3, MAX_CELL = 12, MIN_CELL = 5;
+  const LABEL_COL = 30; // 22px weekday-label column + 8px gap before the grid
   // Native `title` tooltips need the cursor to sit still for ~1s, which on a grid
-  // of 84 tightly-packed 12px cells is easy to miss entirely — a custom tooltip
-  // shown instantly on hover is far more reliable here.
+  // of tightly-packed cells is easy to miss entirely — a custom tooltip shown
+  // instantly on hover is far more reliable here.
   const [hoverCell, setHoverCell] = useState(null); // { x, y, text } | null
+  // Cell size is derived from measured container width so all 52-53 weeks
+  // always fit without a horizontal scrollbar, on any window size.
+  const gridRef = useRef(null);
+  const [containerWidth, setContainerWidth] = useState(0);
+  useLayoutEffect(() => {
+    const el = gridRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(([entry]) => setContainerWidth(entry.contentRect.width));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
   const today = new Date(); today.setHours(0, 0, 0, 0);
-  const start = new Date(today);
-  start.setDate(start.getDate() - today.getDay() - (WEEKS - 1) * 7);
+  const todayISO = localISO(today);
+  const currentYear = today.getFullYear();
 
+  const entries = allJournalEntries(threads);
   const counts = {};
-  allJournalEntries(threads).forEach(e => {
+  let earliestYear = currentYear;
+  entries.forEach(e => {
     if (!e.dateISO) return;
     counts[e.dateISO] = (counts[e.dateISO] || 0) + 1;
+    const y = Number(e.dateISO.slice(0, 4));
+    if (y < earliestYear) earliestYear = y;
   });
+  // GitHub-style year tabs: current year plus every earlier year that has
+  // at least one entry, so the tab list doesn't pad out with empty decades.
+  const years = [];
+  for (let y = currentYear; y >= earliestYear; y--) years.push(y);
+  const [year, setYear] = useState(currentYear);
 
+  // Full calendar year, but trimmed to whole Sun→Sat weeks that fall entirely
+  // inside the year: start at the first Sunday of January, end at the last
+  // Saturday of December. Avoids a leading/trailing partial week bleeding in
+  // days from the previous/next year, which is what made the grid look off.
+  const start = new Date(year, 0, 1);
+  while (start.getDay() !== 0) start.setDate(start.getDate() + 1);
+  const end = new Date(year, 11, 31);
+  while (end.getDay() !== 6) end.setDate(end.getDate() - 1);
+  const WEEKS = Math.round((end - start) / (7 * 24 * 60 * 60 * 1000)) + 1;
+  const gridWidth = Math.max(0, containerWidth - LABEL_COL);
+  const CELL = gridWidth > 0
+    ? Math.min(MAX_CELL, Math.max(MIN_CELL, Math.floor((gridWidth - (WEEKS - 1) * GAP) / WEEKS)))
+    : MAX_CELL;
+
+  // Label a column with a month name only when that month actually starts in
+  // it (the 1st falls within the column) — labeling by the column's first
+  // day (its Sunday) instead put labels a column early/late whenever the 1st
+  // wasn't itself a Sunday. January is special-cased since the grid starts
+  // at the first Sunday of the year, which is never Jan 1 itself unless Jan 1
+  // is a Sunday.
   const columns = [];
-  let lastMonth = null;
   const cursor = new Date(start);
   for (let w = 0; w < WEEKS; w++) {
     const colDays = [];
+    let label = null;
     for (let d = 0; d < 7; d++) {
       const iso = localISO(cursor);
-      colDays.push({ iso, date: new Date(cursor), count: counts[iso] || 0, future: cursor > today });
+      if ((w === 0 && d === 0) || cursor.getDate() === 1) label = MONTH_LABELS[cursor.getMonth()];
+      colDays.push({ iso, date: new Date(cursor), count: counts[iso] || 0 });
       cursor.setDate(cursor.getDate() + 1);
     }
-    const month = colDays[0].date.getMonth();
-    columns.push({ days: colDays, label: month !== lastMonth ? MONTH_LABELS[month] : null });
-    lastMonth = month;
+    columns.push({ days: colDays, label });
   }
 
   return (
-    <HomePanel title="Activity" style={style} accessory={<span style={{ fontSize: 10.5, color: C.text3 }}>Last {WEEKS} weeks</span>}>
-      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+    <HomePanel
+      title="Activity"
+      style={style}
+      accessory={
+        years.length > 1 ? (
+          <div style={{ display: "flex", gap: 2 }}>
+            {years.map(y => (
+              <button
+                key={y}
+                onClick={() => setYear(y)}
+                style={{
+                  fontSize: 10.5, padding: "2px 8px", borderRadius: 6, border: "none", cursor: "pointer",
+                  background: y === year ? C.goldDim : "transparent",
+                  color: y === year ? C.gold : C.text3,
+                  fontWeight: y === year ? 600 : 400,
+                }}
+              >
+                {y}
+              </button>
+            ))}
+          </div>
+        ) : (
+          <span style={{ fontSize: 10.5, color: C.text3 }}>{year}</span>
+        )
+      }
+    >
+      <div ref={gridRef} style={{ display: "flex", flexDirection: "column", gap: 4 }}>
         <div style={{ display: "flex", gap: GAP, paddingLeft: 30 }}>
           {columns.map((col, i) => (
             <div key={i} style={{ width: CELL, fontSize: 9, color: C.text3, whiteSpace: "nowrap" }}>{col.label || ""}</div>
@@ -3112,22 +3338,27 @@ function ActivityHeatmap({ threads, style }) {
             ))}
           </div>
           <div style={{ display: "grid", gridTemplateColumns: `repeat(${WEEKS}, ${CELL}px)`, gridTemplateRows: `repeat(7, ${CELL}px)`, gridAutoFlow: "column", gap: GAP }}>
-            {columns.flatMap(col => col.days).map(({ iso, date, count, future }) => {
-              const text = future ? null : `${count === 0 ? "No activity" : `${count} ${count === 1 ? "entry" : "entries"}`} · ${MONTH_LABELS[date.getMonth()]} ${date.getDate()}`;
+            {columns.flatMap(col => col.days).map(({ iso, date, count }) => {
+              const isToday = iso === todayISO;
+              const text = `${count === 0 ? "No activity" : `${count} ${count === 1 ? "entry" : "entries"}`} · ${MONTH_LABELS[date.getMonth()]} ${date.getDate()}`;
               return (
                 <div
                   key={iso}
-                  onMouseEnter={text ? (e) => setHoverCell({ x: e.clientX, y: e.clientY, text }) : undefined}
-                  onMouseMove={text ? (e) => setHoverCell(h => h && { ...h, x: e.clientX, y: e.clientY }) : undefined}
-                  onMouseLeave={text ? () => setHoverCell(null) : undefined}
-                  style={{ width: CELL, height: CELL, borderRadius: 2, background: future ? "transparent" : heatColor(count) }}
+                  onMouseEnter={(e) => setHoverCell({ x: e.clientX, y: e.clientY, text })}
+                  onMouseMove={(e) => setHoverCell(h => h && { ...h, x: e.clientX, y: e.clientY })}
+                  onMouseLeave={() => setHoverCell(null)}
+                  style={{
+                    width: CELL, height: CELL, borderRadius: 2,
+                    background: heatColor(count),
+                    boxShadow: isToday ? `0 0 0 1.5px ${C.gold}` : "none",
+                  }}
                 />
               );
             })}
           </div>
         </div>
       </div>
-      {hoverCell && (
+      {hoverCell && createPortal(
         <div style={{
           position: "fixed", left: hoverCell.x + 14, top: hoverCell.y + 16, zIndex: 500,
           background: C.surf2, border: `1px solid ${C.border}`, borderRadius: 6,
@@ -3135,7 +3366,8 @@ function ActivityHeatmap({ threads, style }) {
           pointerEvents: "none", boxShadow: "0 6px 16px rgba(0,0,0,0.25)",
         }}>
           {hoverCell.text}
-        </div>
+        </div>,
+        document.body
       )}
     </HomePanel>
   );
@@ -3759,7 +3991,7 @@ function BulkAddModal({ thread, cfg, isBoard, onAdd, onClose }) {
   const checked = parsed.filter(p => p.checked).length;
   return (
     <div onClick={onClose} style={{ position: "fixed", inset: 0, background: C.scrim, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 200, animation: "fadeIn 0.18s ease both", backdropFilter: "blur(6px)" }}>
-      <div onClick={e => e.stopPropagation()} style={{ background: C.modalSurf, border: `1px solid ${C.border}`, borderRadius: 18, padding: "32px", width: 520, animation: "slideIn 0.22s ease both", boxShadow: "0 32px 80px rgba(0,0,0,0.5)" }}>
+      <div className="lm-modal" onClick={e => e.stopPropagation()} style={{ background: C.modalSurf, border: `1px solid ${C.border}`, borderRadius: 18, padding: "32px", width: 520, animation: "slideIn 0.22s ease both", boxShadow: "0 32px 80px rgba(0,0,0,0.5)" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
           <div style={{ fontFamily: "'Cormorant', serif", fontSize: 24, fontWeight: 400 }}>Bulk add</div>
           <button className="ghost" onClick={onClose} style={{ background: "transparent", border: "none", cursor: "pointer", padding: 6, borderRadius: 7, display: "flex" }}>
@@ -4253,7 +4485,7 @@ function ConfirmModal({ title = "Are you sure?", message, confirmLabel = "Delete
   const onAcc   = danger ? C.onDanger : C.onGold;
   return (
     <div onMouseDown={onCancel} style={{ position: "fixed", inset: 0, background: C.scrim, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 300, animation: "fadeIn 0.18s ease both", backdropFilter: "blur(6px)" }}>
-      <div onMouseDown={e => e.stopPropagation()} style={{ background: C.modalSurf, border: `1px solid ${C.border}`, borderRadius: 18, padding: "30px", width: 380, animation: "slideIn 0.22s ease both", boxShadow: "0 32px 80px rgba(0,0,0,0.5)" }}>
+      <div className="lm-modal" onMouseDown={e => e.stopPropagation()} style={{ background: C.modalSurf, border: `1px solid ${C.border}`, borderRadius: 18, padding: "30px", width: 380, animation: "slideIn 0.22s ease both", boxShadow: "0 32px 80px rgba(0,0,0,0.5)" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 14 }}>
           <div style={{ width: 34, height: 34, borderRadius: 9, background: danger ? C.dangerBg : C.goldDim, border: `1px solid ${danger ? C.dangerBorder : C.goldBorder}`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
             <AlertCircle size={17} color={accent} />
@@ -4280,7 +4512,7 @@ function NewModal({ title, setTitle, description, setDescription, type, setType,
   const parentCfg = parentThread ? TYPES[parentThread.type] : null;
   return (
     <div style={{ position: "fixed", inset: 0, background: C.scrim, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 200, animation: "fadeIn 0.18s ease both", backdropFilter: "blur(6px)" }}>
-      <div style={{ background: C.modalSurf, border: `1px solid ${C.border}`, borderRadius: 18, padding: "36px", width: 440, animation: "slideIn 0.22s ease both", boxShadow: "0 32px 80px rgba(0,0,0,0.5)" }}>
+      <div className="lm-modal" style={{ background: C.modalSurf, border: `1px solid ${C.border}`, borderRadius: 18, padding: "36px", width: 440, animation: "slideIn 0.22s ease both", boxShadow: "0 32px 80px rgba(0,0,0,0.5)" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: parentThread ? 16 : 30 }}>
           <div style={{ fontFamily: "'Cormorant', serif", fontSize: 24, fontWeight: 400 }}>{parentThread ? "New Sub-thread" : "New Thread"}</div>
           <button className="ghost" onClick={onClose} style={{ background: "transparent", border: "none", cursor: "pointer", padding: 6, borderRadius: 7, display: "flex" }}>

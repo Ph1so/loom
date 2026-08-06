@@ -7,6 +7,7 @@ contextBridge.exposeInMainWorld("loomAPI", {
   exportMarkdown: (markdown) => ipcRenderer.invoke("export-markdown", markdown),
   revealDataFile: () => ipcRenderer.invoke("reveal-data-file"),
   getDataPath: () => ipcRenderer.invoke("get-data-path"),
+  setWindowVibrancy: (enabled) => ipcRenderer.invoke("set-window-vibrancy", enabled),
 
   // Quick Capture widget
   quickCapture: (text) => ipcRenderer.invoke("quick-capture", text),

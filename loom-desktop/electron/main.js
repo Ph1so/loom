@@ -76,6 +76,34 @@ function readSavedTheme() {
   return "dark";
 }
 
+// Whether the renderer's "translucent window" pref is on. Read alongside the
+// theme at window-create time so a real OS-vibrant window can be created from
+// launch, not just after the user flips the toggle mid-session.
+function readSavedVibrancy() {
+  try {
+    if (fs.existsSync(dataPath)) {
+      const parsed = JSON.parse(fs.readFileSync(dataPath, "utf8"));
+      return !!(parsed?.prefs?.glass && parsed?.prefs?.vibrancy);
+    }
+  } catch {}
+  return false;
+}
+
+// Writes directly into loom-data.json's `prefs`. Only used for the vibrancy
+// toggle: flipping it destroys the renderer (see set-window-vibrancy below)
+// before its own save-on-change effect gets a chance to run, so the change
+// has to be persisted from the main process or it's lost on the next launch.
+function patchSavedPrefs(patch) {
+  try {
+    let data = {};
+    if (fs.existsSync(dataPath)) data = JSON.parse(fs.readFileSync(dataPath, "utf8"));
+    data.prefs = { ...(data.prefs || {}), ...patch };
+    fs.writeFileSync(dataPath, JSON.stringify(data, null, 2), "utf8");
+  } catch (e) {
+    console.error("Failed to patch saved prefs:", e);
+  }
+}
+
 // ── Widget config (separate file, owned entirely by the main process) ──
 // Kept out of loom-data.json because the renderer rewrites that blob wholesale
 // and would erase any keys it doesn't know about.
@@ -333,6 +361,22 @@ ipcMain.handle("reveal-data-file", () => {
 
 ipcMain.handle("get-data-path", () => dataPath);
 
+// ── IPC: window vibrancy (real OS translucency) ─────────────
+// `transparent` is a BrowserWindow constructor-only option in Electron, so
+// toggling it live means recreating the window -- the renderer's saved data
+// (autosaved on every change, see App.jsx) makes this safe, it's just a reload.
+ipcMain.handle("set-window-vibrancy", (event, enabled) => {
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  patchSavedPrefs({ vibrancy: !!enabled });
+  const bounds = mainWindow.getBounds();
+  const wasMaximized = mainWindow.isMaximized();
+  mainWindow.removeAllListeners("closed");
+  mainWindow.destroy();
+  createWindow(!!enabled, bounds);
+  if (wasMaximized) mainWindow.maximize();
+  return true;
+});
+
 // ── IPC: widget config ──────────────────────────────────────
 ipcMain.handle("get-widget-config", () => widgetConfig);
 
@@ -539,17 +583,29 @@ function createWidgetWindow() {
 }
 
 // ── Main window ──────────────────────────────────────────────
-function createWindow() {
+// `bounds`, when given, re-applies the previous window's position/size --
+// used when recreating the window to flip real OS vibrancy on/off, since
+// `transparent` can only be set at construction time, not live.
+function createWindow(vibrancyEnabled = readSavedVibrancy(), bounds = null) {
   const theme = readSavedTheme();
   mainWindow = new BrowserWindow({
-    width: 1280,
-    height: 820,
+    width: bounds?.width || 1280,
+    height: bounds?.height || 820,
+    x: bounds?.x,
+    y: bounds?.y,
     minWidth: 860,
     minHeight: 540,
     titleBarStyle: "hiddenInset",
     trafficLightPosition: { x: 18, y: 22 },
-    backgroundColor: THEME_BG[theme],
-    vibrancy: null,
+    // Deliberately NOT using the `vibrancy` option here. macOS's vibrancy
+    // materials (e.g. "under-window") apply real blur at the OS compositor
+    // level, baked in regardless of any CSS -- that's a hard, native ceiling
+    // no amount of our own opacity/blur tuning can see past. Plain
+    // `transparent: true` with no vibrancy material is raw alpha
+    // compositing: zero forced blur, so our own near-zero CSS blur is the
+    // only blur left, and text behind the window can actually stay legible.
+    transparent: vibrancyEnabled,
+    backgroundColor: vibrancyEnabled ? "#00000000" : THEME_BG[theme],
     icon: path.join(__dirname, "../assets/icon.icns"),
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
