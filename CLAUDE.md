@@ -128,6 +128,7 @@ interface Thread {
   entries: Entry[];        // array order IS the sort order
   displayMode?: "list" | "compact"; // per-thread entry layout in ThreadView; absent = "list"
   sortOrder?: "asc" | "desc";        // per-thread entry sort by date; absent = manual (array order, drag-reorderable)
+  pinned?: boolean;        // favorited on Home; pinned threads sort first in "All Threads"
   createdAt: string;       // cosmetic display string ("Today", "May 21") — NOT an ISO timestamp
   updatedAt: string;       // cosmetic
   special?: "inbox";       // only on the inbox thread

@@ -22,6 +22,8 @@ const G = `
   @keyframes slideIn { from { opacity:0; transform:translateY(16px) scale(0.98); } to { opacity:1; transform:translateY(0) scale(1); } }
   @keyframes spin { to { transform: rotate(360deg); } }
   @keyframes popIn { from { opacity:0; transform:scale(0.6); } to { opacity:1; transform:scale(1); } }
+  @keyframes checkPop { 0% { transform:scale(0.55); } 55% { transform:scale(1.28); } 100% { transform:scale(1); } }
+  @keyframes checkRowSettle { 0%, 55% { opacity:1; transform:translateX(0) scale(1); } 100% { opacity:0; transform:translateX(6px) scale(0.97); } }
   .t-card { transition: background 0.18s, border-color 0.18s, transform 0.18s; }
   .t-card:hover { background: #1C1A15 !important; border-color: rgba(255,255,255,0.11) !important; transform: translateY(-1px); }
   .s-item { transition: background 0.13s; border-radius: 8px; }
@@ -41,6 +43,8 @@ const G = `
   .add-new:hover { border-color: rgba(255,255,255,0.18) !important; background: rgba(255,255,255,0.02) !important; }
   .attn-card { transition: background 0.16s, border-color 0.16s; cursor: pointer; }
   .attn-card:hover { background: #1C1A15 !important; border-color: rgba(255,255,255,0.12) !important; }
+  .home-bento { display: grid; grid-template-columns: repeat(12, 1fr); gap: 18px; align-items: stretch; }
+  @media (max-width: 900px) { .home-bento > * { grid-column: span 12 !important; } }
   .subtype-toggle { transition: all 0.13s; }
   .subtype-toggle:hover { background: rgba(255,255,255,0.06) !important; }
   .move-select { appearance: none; -webkit-appearance: none; }
@@ -345,6 +349,21 @@ function entryDayDiff(entry) {
 function displayEntryDate(entry) {
   if (entry?.dateISO) return formatDue(entry.dateISO);
   return entry?.date || "";
+}
+
+// Flatten every non-archived entry across all threads (optionally including the
+// Inbox) into one array, each tagged with its thread's id/title/type. Shared by
+// the Home dashboard panels that need journal-wide activity (stats, heatmap, "on
+// this day") instead of one thread at a time.
+function allJournalEntries(threads, { includeInbox = true } = {}) {
+  const out = [];
+  threads.forEach(t => {
+    if (!includeInbox && t.id === "inbox") return;
+    t.entries.forEach(e => {
+      if (!e.archived) out.push({ ...e, threadId: t.id, threadTitle: t.title, threadType: t.type });
+    });
+  });
+  return out;
 }
 
 // Real wall-clock timestamp stored on threads (createdAt/updatedAt) and entries
@@ -857,6 +876,11 @@ export default function Loom() {
     }));
   };
 
+  // Home-page favorite: pinned threads float to the front of "All Threads".
+  const toggleThreadPinned = (tid) => {
+    setThreads(p => p.map(t => t.id === tid ? touchThread({ ...t, pinned: !t.pinned }) : t));
+  };
+
   const deleteThread = (tid) => {
     if (tid === "inbox") return;
     setThreads(prev => {
@@ -957,7 +981,7 @@ export default function Loom() {
   const filtered = threads.filter(t => t.id === "inbox" || !search || t.title.toLowerCase().includes(search.toLowerCase()));
   const rootThreads = filtered.filter(t => t.id !== "inbox" && !t.parentId);
 
-  const ops = { addEntry, addEntries, updateEntry, toggleCheck, pinEntry, archiveEntry, setDueDate, setEntryDate, deleteEntry, moveEntry, reorderEntries, renameThread, setThreadDescription, setThreadDisplayMode, setThreadSortOrder, deleteThread };
+  const ops = { addEntry, addEntries, updateEntry, toggleCheck, pinEntry, archiveEntry, setDueDate, setEntryDate, deleteEntry, moveEntry, reorderEntries, renameThread, setThreadDescription, setThreadDisplayMode, setThreadSortOrder, toggleThreadPinned, deleteThread };
   const selection = { selectedThreadIds, selectedEntryIds, toggleThreadSelection, toggleEntrySelection, clearSelection };
   const selectionCount = selectedThreadIds.size + selectedEntryIds.size;
 
@@ -981,7 +1005,7 @@ export default function Loom() {
           clearSelection={clearSelection}
         />
         <main style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
-          {view === "home"     && <HomeView     threads={threads} rootThreads={rootThreads} go={go} setShowNew={setShowNew} addEntry={addEntry} forms={forms} onFillForm={setFillingForm} onSkipForm={skipForm} smartSortReady={smartSortReady} onReview={() => setShowReview(true)} />}
+          {view === "home"     && <HomeView     threads={threads} rootThreads={rootThreads} go={go} setShowNew={setShowNew} addEntry={addEntry} toggleCheck={toggleCheck} pinEntry={pinEntry} toggleThreadPinned={toggleThreadPinned} forms={forms} onFillForm={setFillingForm} onSkipForm={skipForm} smartSortReady={smartSortReady} onReview={() => setShowReview(true)} />}
           {view === "timeline" && <TimelineView threads={threads} go={go} />}
           {view === "forms"    && <FormsView    forms={forms} threads={threads} onNew={() => setEditingForm("new")} onEdit={setEditingForm} onFill={setFillingForm} onDelete={deleteForm} />}
           {current && view !== "home" && view !== "timeline" && view !== "forms" && (
@@ -2172,7 +2196,7 @@ function SbThreadTree({ thread, allThreads, view, go, depth, collapsed, toggleCo
 // ─────────────────────────────────────────────────────────────
 // HOME VIEW
 // ─────────────────────────────────────────────────────────────
-function HomeView({ threads, rootThreads, go, setShowNew, addEntry, forms, onFillForm, onSkipForm, smartSortReady = false, onReview }) {
+function HomeView({ threads, rootThreads, go, setShowNew, addEntry, toggleCheck, pinEntry, toggleThreadPinned, forms, onFillForm, onSkipForm, smartSortReady = false, onReview }) {
   const [capture, setCapture] = useState("");
   const hrs     = new Date().getHours();
   const greet   = hrs < 12 ? "Good morning" : hrs < 17 ? "Good afternoon" : "Good evening";
@@ -2184,53 +2208,103 @@ function HomeView({ threads, rootThreads, go, setShowNew, addEntry, forms, onFil
     setCapture("");
   };
 
+  // Pinned (favorited) threads float to the front; stable within each group.
+  const sortedRootThreads = [
+    ...rootThreads.filter(t => t.pinned),
+    ...rootThreads.filter(t => !t.pinned),
+  ];
+
   return (
     <div style={{ height: "100%", overflowY: "auto", padding: "52px 64px 64px" }}>
-      <div style={{ animation: "fadeUp 0.45s ease both", marginBottom: 44 }}>
+      <div style={{ animation: "fadeUp 0.45s ease both", marginBottom: 40 }}>
         <div style={{ fontFamily: "'Cormorant', serif", fontSize: 46, fontWeight: 300, lineHeight: 1.05, letterSpacing: "-0.015em" }}>{greet}.</div>
         <div style={{ fontSize: 12.5, color: C.text3, marginTop: 8 }}>{dateStr}</div>
       </div>
 
       <FormsDue forms={forms} threads={threads} onFill={onFillForm} onSkip={onSkipForm} />
 
-      <SmartSurface threads={rootThreads} allThreads={threads} go={go} />
+      <div style={{ animation: "fadeUp 0.45s 0.04s ease both", marginBottom: 20 }}>
+        <ActivityHeatmap threads={threads} />
+      </div>
 
-      <div style={{ animation: "fadeUp 0.45s 0.08s ease both", marginBottom: 56 }}>
-        <div style={{ background: C.surf, border: `1px solid ${C.border}`, borderRadius: 16, padding: "22px 26px" }}>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 14 }}>
-            <div style={{ fontSize: 11, color: C.text3, letterSpacing: "0.07em", textTransform: "uppercase", fontWeight: 500 }}>Quick Capture</div>
-            {smartSortReady && (
-              <button
-                onClick={onReview}
-                className="ghost"
-                title="Ask Claude to find entries that belong in a different thread"
-                style={{ display: "inline-flex", alignItems: "center", gap: 6, background: "transparent", border: `1px solid ${C.goldBorder}`, borderRadius: 7, color: C.gold, fontSize: 11.5, padding: "5px 11px", cursor: "pointer" }}
-              >
-                <Sparkles size={12} /> Review placements
-              </button>
-            )}
-          </div>
+      {/* One 12-column bento grid instead of repeated 50/50 rows — each panel
+          claims a different share of the width so the page doesn't read as a
+          stack of identical twin boxes. */}
+      <div className="home-bento" style={{ animation: "fadeUp 0.45s 0.06s ease both", marginBottom: 20 }}>
+        <HomePanel
+          title="Quick Capture"
+          style={{ gridColumn: "span 7" }}
+          accessory={smartSortReady && (
+            <button
+              onClick={onReview}
+              className="ghost"
+              title="Ask Claude to find entries that belong in a different thread"
+              style={{ display: "inline-flex", alignItems: "center", gap: 6, background: "transparent", border: `1px solid ${C.goldBorder}`, borderRadius: 7, color: C.gold, fontSize: 11.5, padding: "5px 11px", cursor: "pointer" }}
+            >
+              <Sparkles size={12} /> Review placements
+            </button>
+          )}
+        >
           <textarea value={capture} onChange={e => setCapture(e.target.value)}
             onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); doCapture(); } }}
             placeholder="Capture a thought -- goes straight to Inbox for triage later..."
-            rows={3} style={{ width: "100%", background: "transparent", border: "none", color: C.text, fontSize: 15, lineHeight: 1.75, resize: "none", fontWeight: 300 }} />
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 18, paddingTop: 16, borderTop: `1px solid ${C.divider}` }}>
+            style={{ width: "100%", flex: 1, minHeight: 90, background: "transparent", border: "none", color: C.text, fontSize: 15, lineHeight: 1.75, resize: "none", fontWeight: 300 }} />
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 18, paddingTop: 16, borderTop: `1px solid ${C.divider}`, flexShrink: 0 }}>
             <span style={{ fontSize: 12, color: C.text3 }}>Enter to capture · Shift+Enter for new line</span>
             <button onClick={doCapture} className="gold-btn" style={{ background: capture.trim() ? C.gold : C.goldDim, border: "none", borderRadius: 8, color: capture.trim() ? C.onGold : C.text3, fontSize: 12.5, padding: "8px 18px", cursor: capture.trim() ? "pointer" : "default", fontWeight: 500 }}>Capture</button>
           </div>
-        </div>
+        </HomePanel>
+
+        <AttentionPanel threads={rootThreads} allThreads={threads} go={go} style={{ gridColumn: "span 5" }} />
+
+        <PinnedTasksPanel threads={threads} toggleCheck={toggleCheck} pinEntry={pinEntry} go={go} style={{ gridColumn: "span 5" }} />
+        <UpcomingAgendaPanel threads={threads} toggleCheck={toggleCheck} go={go} style={{ gridColumn: "span 7" }} />
+
+        <RecentThreadsPanel threads={threads} go={go} style={{ gridColumn: "span 4" }} />
+        <OnThisDayPanel threads={threads} go={go} style={{ gridColumn: "span 8" }} />
       </div>
 
       <div style={{ animation: "fadeUp 0.45s 0.16s ease both" }}>
-        <div style={{ fontSize: 11, color: C.text3, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 20, fontWeight: 500 }}>All Threads</div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(272px, 1fr))", gap: 14 }}>
-          {rootThreads.map((t, i) => <ThreadCard key={t.id} thread={t} threads={threads} go={go} i={i} />)}
-          <div className="add-new t-card" onClick={() => setShowNew("root")} style={{ border: `1.5px dashed ${C.dashed}`, borderRadius: 16, padding: "26px 24px", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10, minHeight: 130, color: C.text3, transition: "all 0.2s" }}>
-            <Plus size={18} strokeWidth={1.5} />
-            <span style={{ fontSize: 12.5 }}>New Thread</span>
+        <HomePanel title="All Threads">
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(272px, 1fr))", gap: 14 }}>
+            {sortedRootThreads.map((t, i) => <ThreadCard key={t.id} thread={t} threads={threads} go={go} i={i} onTogglePin={toggleThreadPinned} />)}
+            <div className="add-new t-card" onClick={() => setShowNew("root")} style={{ border: `1.5px dashed ${C.dashed}`, borderRadius: 16, padding: "26px 24px", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10, minHeight: 130, color: C.text3, transition: "all 0.2s" }}>
+              <Plus size={18} strokeWidth={1.5} />
+              <span style={{ fontSize: 12.5 }}>New Thread</span>
+            </div>
           </div>
-        </div>
+        </HomePanel>
       </div>
+    </div>
+  );
+}
+
+// A bordered rectangle section used across Home to give each kind of content
+// (capture, attention, threads) its own visually distinct block instead of
+// one continuous vertical feed. Header row (title + optional accessory) is
+// fixed; children fill the rest of the box as a flex column.
+function HomePanel({ title, accessory, children, style }) {
+  return (
+    <div style={{ background: C.surf, border: `1px solid ${C.border}`, borderRadius: 16, padding: "22px 26px", display: "flex", flexDirection: "column", ...style }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 14, flexShrink: 0 }}>
+        <div style={{ fontSize: 11, color: C.text3, letterSpacing: "0.07em", textTransform: "uppercase", fontWeight: 500 }}>{title}</div>
+        {accessory}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+// Shared "nothing here yet" filler for Home panels, so every panel can always
+// render a rectangle of a consistent size instead of collapsing to nothing (and
+// the grid jumping around) when a panel happens to have no data today.
+function EmptyPanelState({ icon: Icon, text }) {
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10, color: C.text3, minHeight: 90 }}>
+      <div style={{ width: 34, height: 34, borderRadius: 8, background: C.goldDim, border: `1px solid ${C.goldBorder}`, display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <Icon size={15} color={C.gold} />
+      </div>
+      <span style={{ fontSize: 12.5, textAlign: "center", padding: "0 12px" }}>{text}</span>
     </div>
   );
 }
@@ -2679,17 +2753,19 @@ function QuestionEditor({ q, idx, total, grouping, threadOptions, onChange, onMo
   );
 }
 
-function SmartSurface({ threads, allThreads, go }) {
+function AttentionPanel({ threads, allThreads, go, style }) {
   const items = [];
   // Entries already surfaced as their own "due" card, so the per-thread "action"
   // card below doesn't list them again (one copy only — the one with the badge).
   const surfaced = new Set();
-  // Overdue / due-soon board entries across ALL threads (time-sensitive → first).
+  // Overdue board entries across ALL threads (time-sensitive → first). Due-soon
+  // (not yet overdue) items live in the Upcoming Agenda panel instead, so the
+  // same task doesn't show up in two places.
   (allThreads || threads).filter(t => t.type === "board" && t.id !== "inbox").forEach(t => {
     t.entries.forEach(e => {
       if (e.checked || e.archived || e.subtype === "note" || !e.dueDate) return;
       const diff = dueDayDiff(e.dueDate);
-      if (diff === null || diff > 7) return; // only overdue or within a week
+      if (diff === null || diff >= 0) return; // overdue only
       items.push({ kind: "due", thread: t, entry: e, diff });
       surfaced.add(e.id);
     });
@@ -2706,17 +2782,18 @@ function SmartSurface({ threads, allThreads, go }) {
     const visible = t.entries.filter(e => !e.archived);
     if (visible.length > 0) items.push({ kind: "reflection", thread: t, last: visible[visible.length - 1].text });
   });
-  if (items.length === 0) return null;
   return (
-    <div style={{ animation: "fadeUp 0.45s 0.04s ease both", marginBottom: 48 }}>
-      <div style={{ fontSize: 11, color: C.text3, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 14, fontWeight: 500 }}>Needs Attention</div>
-      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+    <HomePanel title="Needs Attention" style={style}>
+      {items.length === 0 ? (
+        <EmptyPanelState icon={Check} text="All caught up — nothing needs attention." />
+      ) : (
+      <div style={{ display: "flex", flexDirection: "column", gap: 8, flex: 1, minHeight: 0, overflowY: "auto" }}>
         {items.map((item, i) => {
           if (item.kind === "due") {
             const overdue = item.diff < 0;
             const accent  = overdue ? "#D67878" : C.gold;
             return (
-              <div key={i} className="attn-card" onClick={() => go(item.thread.id)} style={{ display: "flex", alignItems: "center", gap: 14, background: C.surf, border: `1px solid ${C.border}`, borderRadius: 12, padding: "14px 18px" }}>
+              <div key={i} className="attn-card" onClick={() => go(item.thread.id)} style={{ display: "flex", alignItems: "center", gap: 14, background: C.surf2, border: `1px solid ${C.border}`, borderRadius: 12, padding: "14px 18px", flexShrink: 0 }}>
                 <div style={{ width: 34, height: 34, borderRadius: 8, background: TYPES.board.bg, border: `1px solid ${TYPES.board.border}`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
                   <Calendar size={15} color={accent} />
                 </div>
@@ -2738,7 +2815,7 @@ function SmartSurface({ threads, allThreads, go }) {
             );
           }
           return (
-          <div key={i} className="attn-card" onClick={() => go(item.thread.id)} style={{ display: "flex", alignItems: "center", gap: 14, background: C.surf, border: `1px solid ${C.border}`, borderRadius: 12, padding: "14px 18px" }}>
+          <div key={i} className="attn-card" onClick={() => go(item.thread.id)} style={{ display: "flex", alignItems: "center", gap: 14, background: C.surf2, border: `1px solid ${C.border}`, borderRadius: 12, padding: "14px 18px", flexShrink: 0 }}>
             <div style={{ width: 34, height: 34, borderRadius: 8, background: TYPES[item.kind === "action" ? "board" : "question"].bg, border: `1px solid ${TYPES[item.kind === "action" ? "board" : "question"].border}`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
               {item.kind === "action" ? <AlertCircle size={15} color={TYPES.board.color} /> : <BookOpen size={15} color={TYPES.question.color} />}
             </div>
@@ -2753,7 +2830,109 @@ function SmartSurface({ threads, allThreads, go }) {
           );
         })}
       </div>
-    </div>
+      )}
+    </HomePanel>
+  );
+}
+
+// A quick-complete checkbox shared by the Pinned Tasks and Upcoming Agenda
+// panels. Plain toggle — no settle/pop animation (that state lives in
+// ThreadView and isn't worth threading into Home for a secondary list).
+function InlineTaskCheck({ onToggle }) {
+  return (
+    <button
+      className="chk"
+      onClick={(e) => { e.stopPropagation(); onToggle(); }}
+      style={{ width: 17, height: 17, borderRadius: 5, border: `1.5px solid ${C.chkBorder}`, background: "transparent", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0, marginTop: 1 }}
+    />
+  );
+}
+
+// Every pinned (starred), still-open board task across ALL threads (any depth) —
+// the things you've deliberately flagged as important, independent of due date.
+// Complements Needs Attention (which surfaces by urgency, not by choice).
+function PinnedTasksPanel({ threads, toggleCheck, pinEntry, go, style }) {
+  const items = [];
+  threads.filter(t => t.type === "board").forEach(t => {
+    t.entries.forEach(e => {
+      if (!e.pinned || e.checked || e.archived || e.subtype === "note") return;
+      items.push({ thread: t, entry: e });
+    });
+  });
+  items.sort((a, b) => {
+    const da = dueDayDiff(a.entry.dueDate), db = dueDayDiff(b.entry.dueDate);
+    if (da === null && db === null) return 0;
+    if (da === null) return 1;
+    if (db === null) return -1;
+    return da - db;
+  });
+
+  return (
+    <HomePanel title="Pinned Tasks" style={style}>
+      {items.length === 0 ? (
+        <EmptyPanelState icon={Pin} text="No pinned tasks — star a task in any board to flag it here." />
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, flex: 1, minHeight: 0, overflowY: "auto" }}>
+          {items.map(({ thread, entry }) => (
+            <div key={entry.id} className="attn-card" onClick={() => go(thread.id)} style={{ display: "flex", alignItems: "center", gap: 12, background: C.surf2, border: `1px solid ${C.border}`, borderRadius: 12, padding: "12px 16px", flexShrink: 0 }}>
+              <InlineTaskCheck onToggle={() => toggleCheck(thread.id, entry.id)} />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 13, color: C.entryText, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entry.text}</div>
+                <div style={{ fontSize: 10.5, color: C.text3, marginTop: 2 }}>
+                  {thread.title}{entry.dueDate ? ` · due ${formatDue(entry.dueDate)}` : ""}
+                </div>
+              </div>
+              <button
+                className="ghost"
+                onClick={(e) => { e.stopPropagation(); pinEntry(thread.id, entry.id); }}
+                title="Unpin"
+                style={{ background: "transparent", border: "none", cursor: "pointer", padding: 4, display: "flex", flexShrink: 0 }}
+              >
+                <Pin size={12} color={C.gold} fill={C.gold} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </HomePanel>
+  );
+}
+
+// Board tasks due in the next 7 days (today included), grouped by day — the
+// forward-looking counterpart to Needs Attention's overdue-only list.
+function UpcomingAgendaPanel({ threads, toggleCheck, go, style }) {
+  const items = [];
+  threads.filter(t => t.type === "board").forEach(t => {
+    t.entries.forEach(e => {
+      if (e.checked || e.archived || e.subtype === "note" || !e.dueDate) return;
+      const diff = dueDayDiff(e.dueDate);
+      if (diff === null || diff < 0 || diff > 7) return;
+      items.push({ thread: t, entry: e, diff });
+    });
+  });
+  items.sort((a, b) => a.diff - b.diff);
+
+  return (
+    <HomePanel title="Upcoming" style={style}>
+      {items.length === 0 ? (
+        <EmptyPanelState icon={Calendar} text="Nothing due in the next 7 days." />
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, flex: 1, minHeight: 0, overflowY: "auto" }}>
+          {items.map(({ thread, entry, diff }) => (
+            <div key={entry.id} className="attn-card" onClick={() => go(thread.id)} style={{ display: "flex", alignItems: "center", gap: 12, background: C.surf2, border: `1px solid ${C.border}`, borderRadius: 12, padding: "12px 16px", flexShrink: 0 }}>
+              <InlineTaskCheck onToggle={() => toggleCheck(thread.id, entry.id)} />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 13, color: C.entryText, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entry.text}</div>
+                <div style={{ fontSize: 10.5, color: C.text3, marginTop: 2 }}>{thread.title}</div>
+              </div>
+              <span style={{ fontSize: 10.5, color: diff === 0 ? C.gold : C.text3, fontWeight: 500, flexShrink: 0 }}>
+                {diff === 0 ? "Today" : diff === 1 ? "Tomorrow" : formatDue(entry.dueDate)}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </HomePanel>
   );
 }
 
@@ -2772,7 +2951,7 @@ function overdueInSubtree(threads, thread) {
   return n;
 }
 
-function ThreadCard({ thread, threads, go, i }) {
+function ThreadCard({ thread, threads, go, i, onTogglePin }) {
   const cfg      = TYPES[thread.type];
   const Icon     = cfg.icon;
   const visibleEntries = thread.entries.filter(e => !e.archived);
@@ -2783,7 +2962,7 @@ function ThreadCard({ thread, threads, go, i }) {
   const children = getChildren(threads, thread.id);
   const overdue  = overdueInSubtree(threads, thread);
   return (
-    <div className="t-card" onClick={() => go(thread.id)} style={{ background: C.surf, border: `1px solid ${C.border}`, borderRadius: 16, padding: "22px 24px", cursor: "pointer", animation: `fadeUp 0.24s ${Math.min(i, 5) * 0.02}s ease both` }}>
+    <div className="t-card" onClick={() => go(thread.id)} style={{ background: C.surf2, border: `1px solid ${thread.pinned ? C.goldBorder : C.border}`, borderRadius: 16, padding: "22px 24px", cursor: "pointer", animation: `fadeUp 0.24s ${Math.min(i, 5) * 0.02}s ease both`, position: "relative" }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 7, background: cfg.bg, border: `1px solid ${cfg.border}`, borderRadius: 6, padding: "4px 10px" }}>
           <Icon size={10} color={cfg.color} />
@@ -2796,6 +2975,16 @@ function ThreadCard({ thread, threads, go, i }) {
             </span>
           )}
           <span style={{ fontSize: 10.5, color: C.text3 }}>{done !== null ? `${done}/${total} done` : `${total} entries`}</span>
+          {onTogglePin && (
+            <button
+              className="ghost"
+              onClick={(e) => { e.stopPropagation(); onTogglePin(thread.id); }}
+              title={thread.pinned ? "Unpin from top" : "Pin to top"}
+              style={{ background: "transparent", border: "none", cursor: "pointer", padding: 2, display: "flex", flexShrink: 0 }}
+            >
+              <Pin size={12} color={thread.pinned ? C.gold : C.text3} fill={thread.pinned ? C.gold : "none"} />
+            </button>
+          )}
         </div>
       </div>
       <div style={{ fontFamily: "'Cormorant', serif", fontSize: 17.5, lineHeight: 1.38, marginBottom: children.length > 0 ? 12 : 16 }}>{thread.title}</div>
@@ -2824,6 +3013,164 @@ function ThreadCard({ thread, threads, go, i }) {
         <span style={{ fontSize: 10, color: C.text3 }}>{formatTimestamp(thread.updatedAt)}</span>
       </div>
     </div>
+  );
+}
+
+// The 6 most-recently-touched threads (any depth, Inbox excluded) — a quick way
+// back into whatever you last worked on, independent of the root-thread grid.
+function RecentThreadsPanel({ threads, go, style }) {
+  const recent = threads
+    .filter(t => t.id !== "inbox")
+    .slice()
+    .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))
+    .slice(0, 6);
+  return (
+    <HomePanel title="Recently Active" style={style}>
+      {recent.length === 0 ? (
+        <EmptyPanelState icon={Clock} text="No threads yet." />
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, flex: 1, minHeight: 0, overflowY: "auto" }}>
+          {recent.map(t => {
+            const cfg = TYPES[t.type]; const Icon = cfg.icon;
+            return (
+              <div key={t.id} className="attn-card" onClick={() => go(t.id)} style={{ display: "flex", alignItems: "center", gap: 12, background: C.surf2, border: `1px solid ${C.border}`, borderRadius: 12, padding: "10px 16px", flexShrink: 0 }}>
+                <div style={{ width: 26, height: 26, borderRadius: 7, background: cfg.bg, border: `1px solid ${cfg.border}`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                  <Icon size={12} color={cfg.color} />
+                </div>
+                <div style={{ flex: 1, minWidth: 0, fontSize: 13, color: C.entryText, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.title}</div>
+                <span style={{ fontSize: 10.5, color: C.text3, flexShrink: 0 }}>{formatTimestamp(t.updatedAt)}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </HomePanel>
+  );
+}
+
+// Gold at increasing opacity per day's entry count — no chart library, just a
+// hex-with-alpha suffix on the existing gold token.
+function heatColor(count) {
+  if (count <= 0) return C.track;
+  if (count === 1) return `${C.gold}3D`;
+  if (count === 2) return `${C.gold}66`;
+  if (count === 3) return `${C.gold}99`;
+  return `${C.gold}FF`;
+}
+
+const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTH_LABELS   = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+// GitHub-style contribution grid: last 12 weeks of journal activity (all
+// threads, Inbox included — a quick capture is still "I used the app today"),
+// aligned to the most recent Sunday so each column is a clean Sun→Sat week.
+// Month labels run along the top (one per column where a new month starts);
+// weekday labels run down the left so each row is identifiable at a glance.
+function ActivityHeatmap({ threads, style }) {
+  const WEEKS = 12, CELL = 12, GAP = 3;
+  // Native `title` tooltips need the cursor to sit still for ~1s, which on a grid
+  // of 84 tightly-packed 12px cells is easy to miss entirely — a custom tooltip
+  // shown instantly on hover is far more reliable here.
+  const [hoverCell, setHoverCell] = useState(null); // { x, y, text } | null
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const start = new Date(today);
+  start.setDate(start.getDate() - today.getDay() - (WEEKS - 1) * 7);
+
+  const counts = {};
+  allJournalEntries(threads).forEach(e => {
+    if (!e.dateISO) return;
+    counts[e.dateISO] = (counts[e.dateISO] || 0) + 1;
+  });
+
+  const columns = [];
+  let lastMonth = null;
+  const cursor = new Date(start);
+  for (let w = 0; w < WEEKS; w++) {
+    const colDays = [];
+    for (let d = 0; d < 7; d++) {
+      const iso = localISO(cursor);
+      colDays.push({ iso, date: new Date(cursor), count: counts[iso] || 0, future: cursor > today });
+      cursor.setDate(cursor.getDate() + 1);
+    }
+    const month = colDays[0].date.getMonth();
+    columns.push({ days: colDays, label: month !== lastMonth ? MONTH_LABELS[month] : null });
+    lastMonth = month;
+  }
+
+  return (
+    <HomePanel title="Activity" style={style} accessory={<span style={{ fontSize: 10.5, color: C.text3 }}>Last {WEEKS} weeks</span>}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+        <div style={{ display: "flex", gap: GAP, paddingLeft: 30 }}>
+          {columns.map((col, i) => (
+            <div key={i} style={{ width: CELL, fontSize: 9, color: C.text3, whiteSpace: "nowrap" }}>{col.label || ""}</div>
+          ))}
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <div style={{ display: "grid", gridTemplateRows: `repeat(7, ${CELL}px)`, gap: GAP, width: 22, flexShrink: 0 }}>
+            {WEEKDAY_LABELS.map(w => (
+              <div key={w} style={{ fontSize: 8.5, color: C.text3, lineHeight: `${CELL}px` }}>{w.slice(0, 2)}</div>
+            ))}
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: `repeat(${WEEKS}, ${CELL}px)`, gridTemplateRows: `repeat(7, ${CELL}px)`, gridAutoFlow: "column", gap: GAP }}>
+            {columns.flatMap(col => col.days).map(({ iso, date, count, future }) => {
+              const text = future ? null : `${count === 0 ? "No activity" : `${count} ${count === 1 ? "entry" : "entries"}`} · ${MONTH_LABELS[date.getMonth()]} ${date.getDate()}`;
+              return (
+                <div
+                  key={iso}
+                  onMouseEnter={text ? (e) => setHoverCell({ x: e.clientX, y: e.clientY, text }) : undefined}
+                  onMouseMove={text ? (e) => setHoverCell(h => h && { ...h, x: e.clientX, y: e.clientY }) : undefined}
+                  onMouseLeave={text ? () => setHoverCell(null) : undefined}
+                  style={{ width: CELL, height: CELL, borderRadius: 2, background: future ? "transparent" : heatColor(count) }}
+                />
+              );
+            })}
+          </div>
+        </div>
+      </div>
+      {hoverCell && (
+        <div style={{
+          position: "fixed", left: hoverCell.x + 14, top: hoverCell.y + 16, zIndex: 500,
+          background: C.surf2, border: `1px solid ${C.border}`, borderRadius: 6,
+          padding: "5px 9px", fontSize: 11, color: C.text, whiteSpace: "nowrap",
+          pointerEvents: "none", boxShadow: "0 6px 16px rgba(0,0,0,0.25)",
+        }}>
+          {hoverCell.text}
+        </div>
+      )}
+    </HomePanel>
+  );
+}
+
+// Entries from this same month/day in a past year — journal-nostalgia, free
+// once there's more than a year of data. Inbox is excluded: quick captures
+// waiting on triage aren't really "memories" yet.
+function OnThisDayPanel({ threads, go, style }) {
+  const today = new Date();
+  const mmdd = `${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+  const currentYear = today.getFullYear();
+  const matches = allJournalEntries(threads, { includeInbox: false })
+    .filter(e => e.dateISO && e.dateISO.slice(5) === mmdd && e.dateISO.slice(0, 4) !== String(currentYear))
+    .sort((a, b) => b.dateISO.localeCompare(a.dateISO))
+    .slice(0, 3);
+
+  return (
+    <HomePanel title="On This Day" style={style}>
+      {matches.length === 0 ? (
+        <EmptyPanelState icon={BookOpen} text="Nothing from this day in past years yet." />
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, flex: 1, minHeight: 0, overflowY: "auto" }}>
+          {matches.map(e => {
+            const years = currentYear - Number(e.dateISO.slice(0, 4));
+            return (
+              <div key={e.id} className="attn-card" onClick={() => go(e.threadId)} style={{ display: "flex", flexDirection: "column", gap: 4, background: C.surf2, border: `1px solid ${C.border}`, borderRadius: 12, padding: "12px 16px", flexShrink: 0 }}>
+                <div style={{ fontSize: 11, color: C.gold, fontWeight: 500 }}>{years} year{years === 1 ? "" : "s"} ago · {e.threadTitle}</div>
+                <div style={{ fontSize: 12.5, color: C.text2, overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>{e.text}</div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </HomePanel>
   );
 }
 
@@ -2965,6 +3312,32 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, addEntries, upd
   const [titleDraft, setTitleDraft]     = useState(thread.title);
   const [editingDesc, setEditingDesc]   = useState(false);
   const [descDraft, setDescDraft]       = useState(thread.description || "");
+  const [settlingIds, setSettlingIds]   = useState(() => new Set()); // board entries mid "just completed" animation
+
+  // Toggling a board entry to checked keeps it visible in the active list for a
+  // beat (with a settle-out animation) instead of snapping straight to Done, so
+  // completing a task gives some visual feedback.
+  const SETTLE_MS = 560;
+  const handleToggleCheck = (tid, eid) => {
+    const entry = thread.entries.find(e => e.id === eid);
+    const willComplete = !!entry && !entry.checked;
+    toggleCheck(tid, eid);
+    setSettlingIds(prev => {
+      const next = new Set(prev);
+      if (willComplete) next.add(eid); else next.delete(eid);
+      return next;
+    });
+    if (willComplete) {
+      setTimeout(() => {
+        setSettlingIds(prev => {
+          if (!prev.has(eid)) return prev;
+          const next = new Set(prev);
+          next.delete(eid);
+          return next;
+        });
+      }, SETTLE_MS);
+    }
+  };
 
   useEffect(() => { setTitleDraft(thread.title); setEditingTitle(false); }, [thread.id, thread.title]);
   useEffect(() => { setDescDraft(thread.description || ""); setEditingDesc(false); }, [thread.id, thread.description]);
@@ -3085,7 +3458,7 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, addEntries, upd
   let activeEntries = thread.entries.filter(e => !e.parentEntryId && !e.archived);
   let doneEntries   = [];
   if (isBoard) {
-    const live = activeEntries.filter(e => !e.checked);
+    const live = activeEntries.filter(e => !e.checked || settlingIds.has(e.id));
     if (sortOrder) {
       // Pinned float to the very top, then due-dated tasks, then the rest — each group
       // sorted by date (due-dated by their dueDate so the nearest deadline leads).
@@ -3098,7 +3471,7 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, addEntries, upd
       const unpinned = live.filter(e => !e.pinned);
       activeEntries  = [...pinned, ...unpinned];
     }
-    doneEntries = sortBy(thread.entries.filter(e => e.checked && !e.parentEntryId && !e.archived), "dateISO");
+    doneEntries = sortBy(thread.entries.filter(e => e.checked && !e.parentEntryId && !e.archived && !settlingIds.has(e.id)), "dateISO");
   } else {
     activeEntries = sortBy(activeEntries, "dateISO");
   }
@@ -3109,13 +3482,13 @@ function ThreadView({ thread, threads, go, setShowNew, addEntry, addEntries, upd
 
   const sharedEntryProps = {
     type: thread.type, cfg, threadId: thread.id,
-    toggleCheck, pinEntry, archiveEntry, setDueDate, setEntryDate, deleteEntry, updateEntry,
+    toggleCheck: handleToggleCheck, pinEntry, archiveEntry, setDueDate, setEntryDate, deleteEntry, updateEntry,
     editingId, setEditingId,
     onReply: (entry) => { setReplyingTo(entry); setTimeout(() => taRef.current?.focus(), 0); },
     isBoard, isInbox, otherThreads, allThreads: threads, moveEntry,
     childrenOf, layout: displayMode, showArchived,
     selectedEntryIds, toggleEntrySelection,
-    smartSortReady,
+    smartSortReady, settlingIds,
   };
 
   return (
@@ -3556,7 +3929,7 @@ function SortSuggestion({ suggestion, threads, onAccept, onReject, onDismiss }) 
 }
 
 // ─── ENTRY ROW ───
-function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, archiveEntry, setDueDate, setEntryDate, deleteEntry, updateEntry, editingId, setEditingId, onReply, isBoard, isInbox, otherThreads, allThreads = [], moveEntry, layout = "list", draggable: isDraggable, dragId, dropId, dropPos, onDragStart, onDragOver, onDrop, onDragEnd, i, selectedEntryIds, toggleEntrySelection, smartSortReady = false }) {
+function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, archiveEntry, setDueDate, setEntryDate, deleteEntry, updateEntry, editingId, setEditingId, onReply, isBoard, isInbox, otherThreads, allThreads = [], moveEntry, layout = "list", draggable: isDraggable, dragId, dropId, dropPos, onDragStart, onDragOver, onDrop, onDragEnd, i, selectedEntryIds, toggleEntrySelection, smartSortReady = false, settlingIds }) {
   const [editText, setEditText] = useState(entry.text);
   const [moveOpen, setMoveOpen] = useState(false);
   const [sortState, setSortState] = useState(null); // null | {status:"loading"} | {status:"error",msg} | {status:"done",suggestion}
@@ -3585,6 +3958,7 @@ function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, archiveEn
   // Compact hides the date/note meta line for plain entries; keep it where it carries info.
   const showMeta   = !isCompact || isBoardEntry || isNote || !!entry.dueDate || !!entry.pinned;
   const isSelected = selectedEntryIds?.has(entry.id);
+  const isSettling = !!settlingIds?.has(entry.id);
   const dueDiff    = dueDayDiff(entry.dueDate);
   const dueColor   = entry.checked
     ? C.text3
@@ -3656,7 +4030,9 @@ function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, archiveEn
         padding: isCompact ? "7px 8px" : "14px 8px",
         borderBottom: `1px solid ${C.divider}`,
         alignItems: "flex-start", position: "relative",
-        animation: `fadeUp 0.18s ${Math.min(i, 6) * 0.012}s ease both`,
+        animation: isSettling && !entry.parentEntryId
+          ? "checkRowSettle 0.56s ease both"
+          : `fadeUp 0.18s ${Math.min(i, 6) * 0.012}s ease both`,
         opacity: isDragging ? 0.4 : 1,
         ...(isSelected ? { background: "rgba(200,165,100,0.10)", outline: `1px solid ${C.goldBorder}`, borderRadius: 8 } : null),
       }}
@@ -3672,7 +4048,7 @@ function EntryRow({ entry, type, cfg, threadId, toggleCheck, pinEntry, archiveEn
         </div>
       )}
       {isBoardEntry ? (
-        <button className="chk" onClick={() => toggleCheck(threadId, entry.id)} style={{ width: 17, height: 17, borderRadius: 5, border: `1.5px solid ${entry.checked ? cfg.color : C.chkBorder}`, background: entry.checked ? cfg.bg : "transparent", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0, marginTop: 3, transition: "all 0.14s" }}>
+        <button className="chk" onClick={() => toggleCheck(threadId, entry.id)} style={{ width: 17, height: 17, borderRadius: 5, border: `1.5px solid ${entry.checked ? cfg.color : C.chkBorder}`, background: entry.checked ? cfg.bg : "transparent", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0, marginTop: 3, transition: "all 0.14s", ...(isSettling ? { animation: "checkPop 0.32s cubic-bezier(0.34,1.56,0.64,1) both", boxShadow: `0 0 0 4px ${cfg.bg}` } : null) }}>
           {entry.checked && <Check size={9} color={cfg.color} strokeWidth={2.5} />}
         </button>
       ) : (
